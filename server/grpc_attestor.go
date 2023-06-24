@@ -26,9 +26,10 @@ import (
 	"github.com/golang/glog"
 	"github.com/gorilla/mux"
 
-	"github.com/salrashid123/tpm_attested_mtls/verifier"
+	"github.com/salrashid123/tls_ak/verifier"
 	"golang.org/x/net/context"
 	"golang.org/x/net/http2"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
 	"github.com/google/go-attestation/attest"
@@ -50,7 +51,8 @@ var (
 	eventLogPath    = flag.String("eventLogPath", "/sys/kernel/security/tpm0/binary_bios_measurements", "Path to the eventlog")
 	tpmDevice       = flag.String("tpmDevice", "/dev/tpm0", "TPMPath")
 	contextsPath    = flag.String("contextsPath", "/tmp/contexts", "Contexts Path")
-	attestationKeys = make(map[string][]byte)
+	httpServerName  = flag.String("httpservername", "echo.esodemoapp2.com", "SNI for http server")
+	grpcServerName  = flag.String("grpcServerName", "attestor.esodemoapp2.com", "SNI for grpc server")
 
 	handleNames = map[string][]tpm2.HandleType{
 		"all":       {tpm2.HandleTypeLoadedSession, tpm2.HandleTypeSavedSession, tpm2.HandleTypeTransient},
@@ -58,11 +60,8 @@ var (
 		"saved":     {tpm2.HandleTypeSavedSession},
 		"transient": {tpm2.HandleTypeTransient},
 	}
-	ek           attest.EK
-	letterRunes  = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-	dynamicCerts tls.Certificate
-	signer       crypto.PrivateKey
-	quit         = make(chan bool)
+	ek          attest.EK
+	letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 )
 
 const ()
@@ -71,8 +70,6 @@ type server struct {
 	mu      sync.Mutex
 	running bool
 }
-
-type echoserver struct{}
 
 type contextKey string
 
@@ -85,10 +82,6 @@ func authUnaryInterceptor(
 	glog.V(40).Infof(">> inbound request")
 	return handler(ctx, req)
 }
-
-// func initServerCerts(ci *tls.ClientHelloInfo) (*tls.Certificate, error) {
-// 	return &dynamicCerts, nil
-// }
 
 func (s *server) GetEK(ctx context.Context, in *verifier.GetEKRequest) (*verifier.GetEKResponse, error) {
 	glog.V(2).Infof("======= GetEK ========")
@@ -356,7 +349,7 @@ func (s *server) NewKey(ctx context.Context, in *verifier.NewKeyRequest) (*verif
 	}
 	pubkeyPem := pem.EncodeToMemory(
 		&pem.Block{
-			Type:  "EC PUBLIC KEY",
+			Type:  "PUBLIC KEY",
 			Bytes: pubkeybytes,
 		},
 	)
@@ -453,7 +446,12 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 		return &verifier.StartTLSResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   Server already running"))
 	}
 
-	go func() error {
+	// todo: improve how this is launched.
+	//  ideally, this should launch in background and the startTLS api call should return
+	//  the status of the server back;  I'm using the errorgoups here to aggregate
+	//  any problems with the startup but these errors are not caught outside of the routine
+	errs, ctx := errgroup.WithContext(ctx)
+	errs.Go(func() error {
 
 		router := mux.NewRouter()
 		router.Methods(http.MethodGet).Path("/").HandlerFunc(gethandler)
@@ -487,13 +485,13 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 		}
 		defer sk.Close()
 
-		signer, err = sk.Private(sk.Public())
+		signer, err := sk.Private(sk.Public())
 		if err != nil {
 			glog.Errorf("  error loading signer %v", err)
 			return fmt.Errorf("ERROR:  error loading signer %v", err)
 		}
 
-		glog.V(2).Infof("        Issuing Selfsigned Cert ========")
+		glog.V(2).Infof("        Issuing Cert ========")
 
 		var notBefore time.Time
 		notBefore = time.Now()
@@ -532,8 +530,8 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 			return fmt.Errorf("ERROR:  error loading signing privatekey")
 		}
 
-		template := x509.Certificate{
-			SerialNumber: serialNumber,
+		// simulate creating a CSR to send to some CA
+		var csrtemplate = x509.CertificateRequest{
 			Subject: pkix.Name{
 				Organization:       []string{"Acme Co"},
 				OrganizationalUnit: []string{"Enterprise"},
@@ -542,7 +540,49 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 				Country:            []string{"US"},
 				CommonName:         "foo",
 			},
-			DNSNames:              []string{"echo.esodemoapp2.com"},
+			DNSNames:           []string{*httpServerName},
+			SignatureAlgorithm: x509.ECDSAWithSHA256,
+		}
+
+		csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &csrtemplate, signer)
+		if err != nil {
+			glog.Errorf("ERROR:  error creating csr %v", err)
+			return fmt.Errorf("ERROR:  error creating csr")
+		}
+
+		csrpemdata := pem.EncodeToMemory(
+			&pem.Block{
+				Type:  "CERTIFICATE REQUEST",
+				Bytes: csrBytes,
+			},
+		)
+		glog.V(2).Infof("      CSR \n%s\n", string(csrpemdata))
+
+		// simulate marshal/unmarshalling the csr on whatever CA you have
+		//  presumably, the CA is part that is doing the verification steps.  So after verification, it'll issue
+		//  an x509 were other http clients can trust
+		//  (i.e, trust that the CA did remote attestation and that the cert was only issued to trusted VMs)
+		//  Here the remote CA is local, just pretend we issue a csr and get it signed.
+		//  for the intent of just verifying that the TLS terminates on a specific attested TPM,
+		//  you don't even need to issue this ca remotely..you can just sign locally
+		clientCSR, err := x509.ParseCertificateRequest(csrBytes)
+		if err != nil {
+			glog.Errorf("ERROR:  error ParseCertificateRequest %v", err)
+			return fmt.Errorf("ERROR:  error ParseCertificateRequest")
+		}
+
+		// now use certain fields within the CSR and the overall template to issue the cert on the CA
+		template := x509.Certificate{
+			SerialNumber: serialNumber,
+			Subject: pkix.Name{
+				Organization:       []string{"Acme Co"},
+				OrganizationalUnit: []string{"Enterprise"},
+				Locality:           []string{"Mountain View"},
+				Province:           []string{"California"},
+				Country:            []string{"US"},
+				CommonName:         clientCSR.Subject.CommonName, // from CSR
+			},
+			DNSNames:              clientCSR.DNSNames, // from CSR
 			NotBefore:             notBefore,
 			NotAfter:              notAfter,
 			KeyUsage:              x509.KeyUsageDigitalSignature,
@@ -551,7 +591,8 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 			IsCA:                  false,
 		}
 
-		derBytes, err := x509.CreateCertificate(rand.Reader, &template, rcert, sk.Public(), r)
+		// now issue the cert; the attestor will use this cert to startup the
+		derBytes, err := x509.CreateCertificate(rand.Reader, &template, rcert, clientCSR.PublicKey, r)
 		if err != nil {
 			glog.Errorf("ERROR:  Failed to create certificate: %s\n", err)
 			return fmt.Errorf("ERROR:  Failed to create certificate: %s\n", err)
@@ -560,9 +601,9 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 		p, err := x509.ParseCertificate(derBytes)
 		if err != nil {
 			glog.Errorf("ERROR:  Failed to  parse certificate: %s", err)
-			fmt.Errorf("ERROR:  Failed to  parse certificate: %s", err)
+			return fmt.Errorf("ERROR:  Failed to  parse certificate: %s", err)
 		}
-		glog.V(2).Infof("cert Issuer %s\n", p.Issuer)
+		glog.V(2).Infof("        cert Issuer %s\n", p.Issuer)
 		c := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 		glog.V(2).Infof("        Issued Certificate ========\n%s\n", c)
 
@@ -573,11 +614,14 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 		}
 		kpem := pem.EncodeToMemory(
 			&pem.Block{
-				Type:  "EC PUBLIC KEY",
+				Type:  "PUBLIC KEY",
 				Bytes: pubkey_bytes,
 			},
 		)
 
+		// once the cert is issued by the CA, it should get returned to the attestor
+		//  the attestor can then startup TLS using this.
+		//  Save the cert that was issued by the CA (or simulated remote CA)
 		if err := os.WriteFile(fmt.Sprintf("%s/%s.%s-tls.crt", *contextsPath, in.Uid, in.Kid), c, 0600); err != nil {
 			glog.Errorf("ERROR:  could not write ak to file %v", err)
 			return fmt.Errorf("ERROR:  writing cert to file")
@@ -603,23 +647,31 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 		http2.ConfigureServer(server, &http2.Server{})
 		glog.V(2).Infof("Starting Server..")
 
-		s.running = true
-		err = server.ListenAndServeTLS("", "")
+		lis, err := net.Listen("tcp", *applicationPort)
 		if err != nil {
 			glog.Errorf("        Error Listening \n%v\n", err)
 			return fmt.Errorf("ERROR: listening: %v", err)
 		}
+		s.running = true
+		server.ServeTLS(lis, "", "")
+
 		return nil
 
-	}()
+	})
 
+	time.Sleep(200 * time.Millisecond)
+	// if err := errs.Wait(); err != nil {
+	// 	glog.Errorf("ERROR:  error startingTLS %v", err)
+	// 	return &verifier.StartTLSResponse{Status: false}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   error startingTLS %v", err))
+	// }
 	return &verifier.StartTLSResponse{
-		Status: true,
+		Status: s.running,
 	}, nil
 
 }
 
 func gethandler(w http.ResponseWriter, r *http.Request) {
+	glog.V(2).Infof("Inbound HTTP request..")
 	fmt.Fprint(w, "ok")
 }
 

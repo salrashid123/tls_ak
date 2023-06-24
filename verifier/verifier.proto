@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package verifier;
 
-option go_package = "github.com/salrashid123/tpm_attested_mtls/verifier";
+option go_package = "github.com/salrashid123/tls_ak/verifier";
 
 service Verifier {
   rpc GetEK (GetEKRequest) returns (GetEKResponse) { }

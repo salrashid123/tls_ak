@@ -1,3 +1,3 @@
-module github.com/salrashid123/tpm_attested_mtls/verifier
+module github.com/salrashid123/tls_ak/verifier
 
 go 1.17

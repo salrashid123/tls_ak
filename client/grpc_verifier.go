@@ -31,7 +31,7 @@ import (
 	"github.com/google/go-tpm-tools/proto/tpm"
 	"github.com/google/go-tpm-tools/server"
 
-	"github.com/salrashid123/tpm_attested_mtls/verifier"
+	"github.com/salrashid123/tls_ak/verifier"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -39,12 +39,12 @@ import (
 const ()
 
 var (
-	address       = flag.String("host", "localhost:50051", "host:port of gRPC server")
-	appaddress    = flag.String("appaddress", "localhost:8081", "host:port of gRPC server")
-	tlsCert       = flag.String("tlsCert", "../certs/ca.crt", "tls Certificate")
-	dynamicCaCert = flag.String("dynamicCaCert", "../certs/issuer_ca.crt", "tls Certificate for dynamic issuer")
-	serverName    = flag.String("servername", "attestor.esodemoapp2.com", "CACert for server")
-
+	address              = flag.String("host", "localhost:50051", "host:port of gRPC server")
+	appaddress           = flag.String("appaddress", "localhost:8081", "host:port of gRPC server")
+	tlsCert              = flag.String("tlsCert", "../certs/ca.crt", "tls Certificate")
+	dynamicCaCert        = flag.String("dynamicCaCert", "../certs/issuer_ca.crt", "tls Certificate for dynamic issuer")
+	grpcServerName       = flag.String("grpcservername", "attestor.esodemoapp2.com", "SNI for grpc server")
+	httpServerName       = flag.String("httpservername", "echo.esodemoapp2.com", "SNI for http server")
 	expectedPCRMapSHA256 = flag.String("expectedPCRMapSHA256", "0:d0c70a9310cd0b55767084333022ce53f42befbb69c059ee6c0a32766f160783", "Sealing and Quote PCRMap (as comma separated key:value).  pcr#:sha256,pcr#sha256.  Default value uses pcr0:sha256")
 
 	u   = flag.String("uid", uuid.New().String(), "uid of client")
@@ -77,7 +77,7 @@ func main() {
 		os.Exit(1)
 	}
 	tlsCfg.RootCAs = rootCAs
-	tlsCfg.ServerName = *serverName
+	tlsCfg.ServerName = *grpcServerName
 
 	ce := credentials.NewTLS(&tlsCfg)
 	ctx := context.Background()
@@ -441,7 +441,7 @@ func main() {
 	glog.V(5).Infof("     signature verified")
 	glog.V(5).Infof("=============== end Sign ===============")
 
-	glog.V(5).Infof("=============== start Sign ===============")
+	glog.V(5).Infof("=============== start StartTLS ===============")
 
 	startTLSResponse, err := c.StartTLS(ctx, &verifier.StartTLSRequest{
 		Uid: *u,
@@ -451,8 +451,7 @@ func main() {
 		glog.Errorf("startTLSResponse Failed,  Original Error is: %v", err)
 		os.Exit(1)
 	}
-	glog.V(5).Infof("     startTLSResponse verified %t", startTLSResponse.Status)
-	glog.V(5).Infof("     startTLSResponse %s", startTLSResponse)
+	glog.V(5).Infof("     startTLSResponse status %t", startTLSResponse.Status)
 
 	glog.V(5).Infof("=============== start http client ===============")
 
@@ -471,7 +470,7 @@ func main() {
 
 	dynamicTLSConfig := &tls.Config{
 		RootCAs:    roots,
-		ServerName: "echo.esodemoapp2.com",
+		ServerName: *httpServerName,
 	}
 
 	tr := &http.Transport{
@@ -506,6 +505,15 @@ func main() {
 		},
 	)
 	glog.V(5).Infof("     peer public key \n%s\n", kpem)
+
+	// compare the peer key with the one we got from NewKey() call
+
+	if base64.StdEncoding.EncodeToString(newKeyResponse.Public) == base64.StdEncoding.EncodeToString(kpem) {
+		glog.V(5).Info("     peer tls public key matched attested key")
+	} else {
+		glog.Errorf("ERROR:  peer public keys mismatch  expected \n[%s]\n\ngot: \n[%s]", newKeyResponse.Public, kpem)
+		os.Exit(1)
+	}
 
 	htmlData, err := ioutil.ReadAll(resp.Body)
 	if err != nil {

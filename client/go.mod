@@ -8,7 +8,7 @@ require (
 	github.com/google/go-tpm v0.3.3
 	github.com/google/go-tpm-tools v0.3.12
 	github.com/google/uuid v1.3.0
-	github.com/salrashid123/tpm_attested_mtls/verifier v0.0.0
+	github.com/salrashid123/tls_ak/verifier v0.0.0
 	google.golang.org/grpc v1.55.0
 	google.golang.org/protobuf v1.30.0
 )
@@ -31,5 +31,5 @@ require (
 )
 
 replace (
-	github.com/salrashid123/tpm_attested_mtls/verifier => "../verifier"
+	github.com/salrashid123/tls_ak/verifier => "../verifier"
 )
