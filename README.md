@@ -300,3 +300,38 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEiUhixeI1eFnuXv1w/3R+yRwOzR2+
 uWz3ADKkRpWvJ8qfjN7rE2NUv5RnWaUs/V1f+9+f3JufjwckXtvUTSJDOQ==
 -----END PUBLIC KEY-----
 ```
+
+---
+
+Final note, GCE VMs also surface an API that returns the EKPub encryption (and signing/AK) keys:
+
+compare the ekPub below against the ek returned by the server above:
+
+```bash
+$ gcloud compute instances get-shielded-identity attestor
+encryptionKey:
+  ekPub: |
+    -----BEGIN PUBLIC KEY-----
+    MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyLLB37zQTi3KfKridPpY
+    tj9yKm0ci/QUGqrzBsVVqxqOsQUxocsaKMZPIO7VxJlJd8KHWMoGY6f1VOdNUFCN
+    ufg5WMqA/t6rXvjF4NtPTvR05dCV4JegBBDnOjF9NgmV67+NgAm3afq/Z1qvJ336
+    WUop2prbTWpseNtdlp2+4TOBSsNZgsum3CFr40qIsa2rb9xFDrqoMTVkgKGpJk+z
+    ta+pcxGXYFJfU9sb7F7cs3e+TzjucGFcpVEiFzVq6Mga8cmh32sufM/PuifVYSLi
+    BYV4s4c53gVq7v0Oda9LqaxT2A9EmKopcWUU8CEgbsBxhmVAhsnKwLDmJYKULkAk
+    uwIDAQAB
+    -----END PUBLIC KEY-----
+kind: compute#shieldedInstanceIdentity
+signingKey:
+  ekPub: |
+    -----BEGIN PUBLIC KEY-----
+    MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtvr8f4lOUaHIMDoC9Baq
+    sLs2Irh1RrKmTbgf/cWZHvhCQUT3qGGB5gqI96/efF3pCKx/KL9tYpJ7iQ3TpJhv
+    E8sG+bfxA3qvoDXIzO8bsAPyEp6c77UfvHkasi4cKZP2kBIURy/TwOSeZco7qU51
+    V10pL4kcw8J0CeDr4KKap6m4gWXcdo4rOpRMy62bBRIaxWEbPrAlotHSoD6hvtlT
+    W0zBhs4zFrau+85YZNuobvvkPoZho/NosLKqNZ2gb2/ueY/mU0uAPhhtHtk7KWiN
+    p5iSqcWHyrzU/tZ3LwiRB/vOxeQhWH3+o3BJPU0z9Dm+5fFlO6Se4hm1/S8VxYZ4
+    owIDAQAB
+    -----END PUBLIC KEY-----
+```
+
+Unfortunately, the `go-attestation` library i'm using does not easily surface the ekSigning key for attestation.  see [issue#334](https://github.com/google/go-attestation/issues/334)
