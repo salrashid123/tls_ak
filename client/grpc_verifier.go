@@ -128,7 +128,7 @@ func main() {
 		glog.V(10).Infof("     EKCert  IssuingCertificateURL %v", fmt.Sprint(ekcert.IssuingCertificateURL))
 
 		gceInfo, err := server.GetGCEInstanceInfo(ekcert)
-		if err == nil {
+		if err == nil && gceInfo != nil {
 			glog.V(10).Infof("     EKCert  GCE InstanceID %d", gceInfo.InstanceId)
 			glog.V(10).Infof("     EKCert  GCE InstanceName %s", gceInfo.InstanceName)
 			glog.V(10).Infof("     EKCert  GCE ProjectId %s", gceInfo.ProjectId)

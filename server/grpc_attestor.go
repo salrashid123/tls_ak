@@ -558,13 +558,12 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 		)
 		glog.V(2).Infof("      CSR \n%s\n", string(csrpemdata))
 
-		// simulate marshal/unmarshalling the csr on whatever CA you have
-		//  presumably, the CA is part that is doing the verification steps.  So after verification, it'll issue
-		//  an x509 were other http clients can trust
-		//  (i.e, trust that the CA did remote attestation and that the cert was only issued to trusted VMs)
-		//  Here the remote CA is local, just pretend we issue a csr and get it signed.
-		//  for the intent of just verifying that the TLS terminates on a specific attested TPM,
-		//  you don't even need to issue this ca remotely..you can just sign locally
+		// simulate marshal/unmarshalling the csr on whatever CA you have.
+		//  The CA is should be something the verifier trusts.
+		//  Here the remote CA is local, just pretend we issue a csr and get it signed by that CA.
+		// in an alternative flow, the CSR here could even be sent back to each verifier...the verifier
+		//  would then issue the x509 and then return to the attestor.
+		//   the attestor would startTLS  and listening using that (ofcourse that flow requires new methods/flows)
 		clientCSR, err := x509.ParseCertificateRequest(csrBytes)
 		if err != nil {
 			glog.Errorf("ERROR:  error ParseCertificateRequest %v", err)
@@ -619,7 +618,7 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 			},
 		)
 
-		// once the cert is issued by the CA, it should get returned to the attestor
+		// pretend the CSR was sent to a CA and the response was provided here
 		//  the attestor can then startup TLS using this.
 		//  Save the cert that was issued by the CA (or simulated remote CA)
 		if err := os.WriteFile(fmt.Sprintf("%s/%s.%s-tls.crt", *contextsPath, in.Uid, in.Kid), c, 0600); err != nil {
@@ -659,7 +658,8 @@ func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*v
 
 	})
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(1000 * time.Millisecond)
+
 	// if err := errs.Wait(); err != nil {
 	// 	glog.Errorf("ERROR:  error startingTLS %v", err)
 	// 	return &verifier.StartTLSResponse{Status: false}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   error startingTLS %v", err))

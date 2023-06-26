@@ -1,7 +1,7 @@
 
 ## TPM based TLS using Attested Keys
 
-Sample demonstrating `TLS` where the private key on the server is bound to its TPM after its attested though [TPM Remote Attestation](https://tpm2-software.github.io/tpm2-tss/getting-started/2019/12/18/Remote-Attestation.html).
+`TLS` where the private key on the server is bound to its `Trusted Platform Module (TPM)` after the keys are attested though [TPM Remote Attestation](https://tpm2-software.github.io/tpm2-tss/getting-started/2019/12/18/Remote-Attestation.html).
 
 This ensures the client is connecting to the remote host where the TPM resides
 
@@ -12,7 +12,7 @@ Basically,
 3. Client contacts server requesting `Attestation Key (AK)`
 4. Client and Server perform TPM [Remote Attestation](https://tpm2-software.github.io/tpm2-tss/getting-started/2019/12/18/Remote-Attestation.html)
 5. CLient and Server perform TPM [Quote-Verify](https://github.com/salrashid123/tpm2/tree/master/quote_verify) to ensure the server state is correct
-6. Client requests an Attested EC Private Key where the private key resides on the Server's TPM.
+6. Client requests an _Attested EC Key_ where the private key resides on the Server's TPM.
 7. Client requests server for a locally signed `x509` certificate where the private key is the Attested EC key
 8. Server issues the `x509` with a local CA (the ca can be an actual CA; this demo issues locally)
 9. Server launches a new `HTTPS` server where the server certificate and private key are the newly issued x509 and TPM hosted EC private key
@@ -29,9 +29,7 @@ After that, a new `HTTPS` server is launched which uses the EC Key on the TPM an
 
 so whats so good about this?  well, your client is _assured_ that they are terminating the TLS connection on that VM that includes that specific TPM.
 
-ofcourse before you jump in, note that the TPM is a char device so concurrent access is limited
-
-anyway, The part where CA certificate (local or otherwise) issues the x509 (step 7) isn't the critical part in this flow:  the fact that the attested _EC Public Key matches whats in the certificate and TLS session is important_.
+Note the part where CA certificate (local or otherwise) issues the x509 (step 7) isn't the critical part in this flow:  the fact that the attested _EC Public Key matches whats in the certificate and TLS session is important_.  If you wanted, instead of the attestor's CA that issues the x509, the client could've done that given the attested public key and its own CA and then returned the x509 to the server which would then be used it to start the TLS-HTTP server.  (see example [here](https://gist.github.com/salrashid123/10320c153ad6acdc31854c9775c43c0d) on how to apply a attested public key to a cert)
 
 ---
 
@@ -63,12 +61,14 @@ export ATTESTOR_ADDRESS=35.193.185.190
 # tpm2_pcrread sha256:0
 #  sha256:
 #    0 : 0xD0C70A9310CD0B55767084333022CE53F42BEFBB69C059EE6C0A32766F160783
+# alternatively, you can use go-tpm's pcrread: https://github.com/salrashid123/tpm2/tree/master/pcr_utils
 ```
 
 SSH to the attestor, [install golang](https://go.dev/doc/install) and run
 
 ```bash
 mkdir /tmp/contexts
+
 git clone https://github.com/salrashid123/tls_ak.git
 cd tls_ak/
 go run grpc_attestor.go --grpcport :50051 --v=10 -alsologtostderr
@@ -78,14 +78,17 @@ go run grpc_attestor.go --grpcport :50051 --v=10 -alsologtostderr
 On the laptop, run the attestor
 
 ```bash
-go run grpc_verifier.go --host=$ATTESTOR_ADDRESS:50051 --appaddress=$ATTESTOR_ADDRESS:8081 --v=10 -alsologtostderr
+go run grpc_verifier.go --host=$ATTESTOR_ADDRESS:50051 \
+   --appaddress=$ATTESTOR_ADDRESS:8081 \
+   --expectedPCRMapSHA256=0:d0c70a9310cd0b55767084333022ce53f42befbb69c059ee6c0a32766f160783 \
+    --v=10 -alsologtostderr
 ```
 
 
 What you'll see in the output is the full remote attestation, then a certificate issued with a specific public key where the private key is on the TPM (and is attested by AK)
 
 
-The client connects to the server and prints the public key....the fact the same public keys 
+The client connects to the server and prints the public key....the fact the same public keys are shown confirms the attested key on the TPM is at the other end of the TLS session.
 
 ---
 
@@ -335,3 +338,5 @@ signingKey:
 ```
 
 Unfortunately, the `go-attestation` library i'm using does not easily surface the ekSigning key for attestation.  see [issue#334](https://github.com/google/go-attestation/issues/334)
+
+As for RSA keys, it turns out the for TPMs, [rsa.PSSSaltLengthAuto](https://pkg.go.dev/crypto/rsa#PSSOptions) is used but whats provided via go1.17+ during TLS1.3 is  [PSSSaltLengthEqualsHash](https://pkg.go.dev/crypto/rsa#pkg-constants)...meaning its difficult to make RSA to work at the moment with go and TLS specifically. (for ref, see [tpm2-pkcs11/issues/417](https://github.com/tpm2-software/tpm2-pkcs11/issues/417))
