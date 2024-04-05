@@ -70,7 +70,8 @@ SSH to the attestor, [install golang](https://go.dev/doc/install) and run
 mkdir /tmp/contexts
 
 git clone https://github.com/salrashid123/tls_ak.git
-cd tls_ak/
+cd tls_ak/server
+
 go run grpc_attestor.go --grpcport :50051 --v=10 -alsologtostderr
 ```
 
@@ -78,6 +79,9 @@ go run grpc_attestor.go --grpcport :50051 --v=10 -alsologtostderr
 On the laptop, run the attestor
 
 ```bash
+git clone https://github.com/salrashid123/tls_ak.git
+cd tls_ak/client
+
 go run grpc_verifier.go --host=$ATTESTOR_ADDRESS:50051 \
    --appaddress=$ATTESTOR_ADDRESS:8081 \
    --expectedPCRMapSHA256=0:d0c70a9310cd0b55767084333022ce53f42befbb69c059ee6c0a32766f160783 \
@@ -241,6 +245,13 @@ $ openssl s_client --connect $ATTESTOR_ADDRESS:8081
 Note the certificate specifications and public key matches the attested EC public key that was tied to the TPM
 
 ```bash
+$ openssl s_client -connect $ATTESTOR_ADDRESS:8081 | openssl x509 -pubkey -noout
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEiUhixeI1eFnuXv1w/3R+yRwOzR2+
+uWz3ADKkRpWvJ8qfjN7rE2NUv5RnWaUs/V1f+9+f3JufjwckXtvUTSJDOQ==
+-----END PUBLIC KEY-----
+
+### or download and save the x509 cert to "a.crt":
 $ openssl x509 -in a.crt -text -noout
 
 Certificate:

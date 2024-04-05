@@ -43,8 +43,8 @@ var (
 	appaddress           = flag.String("appaddress", "localhost:8081", "host:port of gRPC server")
 	tlsCert              = flag.String("tlsCert", "../certs/ca.crt", "tls Certificate")
 	dynamicCaCert        = flag.String("dynamicCaCert", "../certs/issuer_ca.crt", "tls Certificate for dynamic issuer")
-	grpcServerName       = flag.String("grpcservername", "attestor.esodemoapp2.com", "SNI for grpc server")
-	httpServerName       = flag.String("httpservername", "echo.esodemoapp2.com", "SNI for http server")
+	grpcServerName       = flag.String("grpcservername", "attestor.domain.com", "SNI for grpc server")
+	httpServerName       = flag.String("httpservername", "echo.domain.com", "SNI for http server")
 	expectedPCRMapSHA256 = flag.String("expectedPCRMapSHA256", "0:d0c70a9310cd0b55767084333022ce53f42befbb69c059ee6c0a32766f160783", "Sealing and Quote PCRMap (as comma separated key:value).  pcr#:sha256,pcr#sha256.  Default value uses pcr0:sha256")
 
 	u   = flag.String("uid", uuid.New().String(), "uid of client")

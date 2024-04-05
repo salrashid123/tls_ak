@@ -51,8 +51,8 @@ var (
 	eventLogPath    = flag.String("eventLogPath", "/sys/kernel/security/tpm0/binary_bios_measurements", "Path to the eventlog")
 	tpmDevice       = flag.String("tpmDevice", "/dev/tpm0", "TPMPath")
 	contextsPath    = flag.String("contextsPath", "/tmp/contexts", "Contexts Path")
-	httpServerName  = flag.String("httpservername", "echo.esodemoapp2.com", "SNI for http server")
-	grpcServerName  = flag.String("grpcServerName", "attestor.esodemoapp2.com", "SNI for grpc server")
+	httpServerName  = flag.String("httpservername", "echo.domain.com", "SNI for http server")
+	grpcServerName  = flag.String("grpcServerName", "attestor.domain.com", "SNI for grpc server")
 
 	handleNames = map[string][]tpm2.HandleType{
 		"all":       {tpm2.HandleTypeLoadedSession, tpm2.HandleTypeSavedSession, tpm2.HandleTypeTransient},
