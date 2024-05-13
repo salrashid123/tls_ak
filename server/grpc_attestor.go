@@ -2,26 +2,23 @@ package main
 
 import (
 	"bytes"
-	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
-	"io/ioutil"
+	"math/big"
 	"net/http"
+	"time"
 
 	"flag"
 	"fmt"
-	"math/big"
-	mrnd "math/rand"
 	"net"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/golang/glog"
 	"github.com/gorilla/mux"
@@ -33,10 +30,10 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/google/go-attestation/attest"
-	"github.com/google/go-tpm-tools/client"
-	"github.com/google/go-tpm/tpm2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
 const ()
@@ -44,24 +41,23 @@ const ()
 var (
 	grpcport        = flag.String("grpcport", "", "grpcport")
 	applicationPort = flag.String("applicationPort", ":8081", "grpcport")
-	tlsCert         = flag.String("tlsCert", "../certs/server.crt", "tls Certificate")
-	tlsKey          = flag.String("tlsKey", "../certs/server.key", "tls Key")
-	issuerCert      = flag.String("issuerCert", "../certs/issuer_ca.crt", "tls Certificate")
-	issuerKey       = flag.String("issuerKey", "../certs/issuer_ca.key", "tls Key")
+	tlsCert         = flag.String("tlsCert", "certs/server.crt", "tls Certificate")
+	tlsKey          = flag.String("tlsKey", "certs/server.key", "tls Key")
+	issuerCert      = flag.String("issuerCert", "certs/issuer_ca.crt", "tls Certificate")
+	issuerKey       = flag.String("issuerKey", "certs/issuer_ca.key", "tls Key")
 	eventLogPath    = flag.String("eventLogPath", "/sys/kernel/security/tpm0/binary_bios_measurements", "Path to the eventlog")
 	tpmDevice       = flag.String("tpmDevice", "/dev/tpm0", "TPMPath")
-	contextsPath    = flag.String("contextsPath", "/tmp/contexts", "Contexts Path")
-	httpServerName  = flag.String("httpservername", "echo.domain.com", "SNI for http server")
-	grpcServerName  = flag.String("grpcServerName", "attestor.domain.com", "SNI for grpc server")
 
-	handleNames = map[string][]tpm2.HandleType{
-		"all":       {tpm2.HandleTypeLoadedSession, tpm2.HandleTypeSavedSession, tpm2.HandleTypeTransient},
-		"loaded":    {tpm2.HandleTypeLoadedSession},
-		"saved":     {tpm2.HandleTypeSavedSession},
-		"transient": {tpm2.HandleTypeTransient},
-	}
-	ek          attest.EK
-	letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	httpServerName = flag.String("httpservername", "echo.domain.com", "SNI for http server")
+	grpcServerName = flag.String("grpcServerName", "attestor.domain.com", "SNI for grpc server")
+
+	tpm               *attest.TPM
+	ek                *attest.EK
+	ekpubBytes        []byte
+	ekCert            *x509.Certificate
+	akbytes           []byte
+	nkBytes           []byte
+	issuedTLSderBytes []byte
 )
 
 const ()
@@ -79,93 +75,93 @@ func authUnaryInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
-	glog.V(40).Infof(">> inbound request")
+	p, ok := peer.FromContext(ctx)
+	if ok {
+		peerIPPort, _, err := net.SplitHostPort(p.Addr.String())
+		if err != nil {
+			return nil, status.Errorf(codes.PermissionDenied, fmt.Sprintf("Could not get Remote IP   %v", err))
+		}
+		glog.V(20).Infof("     Connected from peer %v", peerIPPort)
+	} else {
+		glog.Errorf("ERROR:  Could not extract peerInfo from TLS")
+		return nil, status.Errorf(codes.PermissionDenied, "ERROR:  Could not extract peerInfo from TLS")
+	}
 	return handler(ctx, req)
+}
+
+const contextEventKey contextKey = "event"
+
+type event struct {
+	PeerCertificates []*x509.Certificate
+	EKM              string
+	PeerIP           string
+}
+
+func eventsMiddleware(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "UserIP is not in host:port format", http.StatusInternalServerError)
+			return
+		}
+		userIP := net.ParseIP(ip)
+		if userIP == nil {
+			http.Error(w, "error parsing remote IP", http.StatusInternalServerError)
+			return
+		}
+
+		ekm, err := r.TLS.ExportKeyingMaterial("my_nonce", nil, 32)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		glog.V(40).Infof("EKM my_nonce: %s\n", hex.EncodeToString(ekm))
+
+		event := &event{
+			PeerCertificates: r.TLS.PeerCertificates,
+			EKM:              hex.EncodeToString(ekm),
+			PeerIP:           ip,
+		}
+		ctx := context.WithValue(r.Context(), contextEventKey, *event)
+		h.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func (s *server) GetEK(ctx context.Context, in *verifier.GetEKRequest) (*verifier.GetEKResponse, error) {
 	glog.V(2).Infof("======= GetEK ========")
-	if ek.Public != nil {
-		pubBytes, err := x509.MarshalPKIXPublicKey(ek.Public)
-		if err != nil {
-			glog.Errorf("ERROR:  could  marshall public key %v", err)
-			return &verifier.GetEKResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   could  marshall public key"))
-		}
 
-		if ek.Certificate != nil {
-			return &verifier.GetEKResponse{
-				EkPub:  pubBytes,
-				EkCert: ek.Certificate.Raw,
-			}, nil
-		}
+	if ekCert != nil {
 		return &verifier.GetEKResponse{
-			EkPub: pubBytes,
+			EkPub:  ekpubBytes,
+			EkCert: ekCert.Raw,
 		}, nil
-	} else {
-		glog.Errorf("ERROR:  could  EK not set")
-		return &verifier.GetEKResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  could  not set"))
 	}
+	return &verifier.GetEKResponse{
+		EkPub: ekpubBytes,
+	}, nil
+
 }
 
 func (s *server) GetAK(ctx context.Context, in *verifier.GetAKRequest) (*verifier.GetAKResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	glog.V(2).Infof("======= GetAK ========")
-	if s.running {
-		return &verifier.GetAKResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   Server already running"))
-	}
 
-	config := &attest.OpenConfig{
-		TPMVersion: attest.TPMVersion20,
-	}
-	tpm, err := attest.OpenTPM(config)
+	ak, err := tpm.LoadAK(akbytes)
 	if err != nil {
-		glog.Errorf("ERROR:  opening tpm %v", err)
-		return &verifier.GetAKResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  could not get TPM"))
+		glog.Errorf("error loading ak %v", err)
+		return &verifier.GetAKResponse{}, status.Errorf(codes.Internal, "ERROR:  error loading ak")
 	}
-	defer tpm.Close()
-
-	var attestParams attest.AttestationParameters
-
-	if _, err := os.Stat(fmt.Sprintf("%s/%s.ak", *contextsPath, in.Uid)); err == nil {
-		akBytes, err := os.ReadFile(fmt.Sprintf("%s/%s.ak", *contextsPath, in.Uid))
-		if err != nil {
-			glog.Errorf("ERROR:  error reading ak file at path %v", err)
-			return &verifier.GetAKResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   error reading ak file at path"))
-		}
-		ak, err := tpm.LoadAK(akBytes)
-		if err != nil {
-			glog.Errorf("ERROR:  error loading ak AK %v", err)
-			return &verifier.GetAKResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error loading ak"))
-		}
-		defer ak.Close(tpm)
-		attestParams = ak.AttestationParameters()
-	} else {
-		akConfig := &attest.AKConfig{}
-		ak, err := tpm.NewAK(akConfig)
-		if err != nil {
-			glog.Errorf("ERROR:  could not get AK %v", err)
-			return &verifier.GetAKResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  could get AK"))
-		}
-		attestParams = ak.AttestationParameters()
-		akBytes, err := ak.Marshal()
-		if err != nil {
-			glog.Errorf("ERROR:  could not marshall AK %v", err)
-			return &verifier.GetAKResponse{}, grpc.Errorf(codes.FailedPrecondition, fmt.Sprintf("ERROR:  could get AK"))
-		}
-		if err := os.WriteFile(fmt.Sprintf("%s/%s.ak", *contextsPath, in.Uid), akBytes, 0600); err != nil {
-			glog.Errorf("ERROR:  could not write ak to file %v", err)
-			return &verifier.GetAKResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  writing AK to file"))
-		}
-	}
+	defer ak.Close(tpm)
+	attestParams := ak.AttestationParameters()
 	attestParametersBytes := new(bytes.Buffer)
 	err = json.NewEncoder(attestParametersBytes).Encode(attestParams)
 	if err != nil {
 		glog.Errorf("ERROR:  encode attestation parameters AK %v", err)
-		return &verifier.GetAKResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  could generate attestationParameters"))
+		return &verifier.GetAKResponse{}, status.Errorf(codes.Internal, "ERROR:  could generate attestationParameters")
 	}
 	return &verifier.GetAKResponse{
-		Ak: attestParametersBytes.Bytes(),
+		AttestationParameters: attestParametersBytes.Bytes(),
 	}, nil
 }
 
@@ -173,48 +169,24 @@ func (s *server) Attest(ctx context.Context, in *verifier.AttestRequest) (*verif
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	glog.V(2).Infof("======= Attest ========")
-	if s.running {
-		return &verifier.AttestResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   Server already running"))
-	}
 
-	config := &attest.OpenConfig{
-		TPMVersion: attest.TPMVersion20,
-	}
-	tpm, err := attest.OpenTPM(config)
-	if err != nil {
-		glog.Errorf("ERROR:  opening tpm %v", err)
-		return &verifier.AttestResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  could not get TPM"))
-	}
-	defer tpm.Close()
-
-	_, err = os.Stat(fmt.Sprintf("%s/%s.ak", *contextsPath, in.Uid))
-	if err != nil {
-		glog.Errorf("ERROR:  cannot Attest without Attestion Key; first run GetAK %v", err)
-		return &verifier.AttestResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   cannot Attest without Attestion Key; first run GetAK"))
-	}
-
-	akBytes, err := os.ReadFile(fmt.Sprintf("%s/%s.ak", *contextsPath, in.Uid))
-	if err != nil {
-		glog.Errorf("ERROR:  error reading ak file at path %v", err)
-		return &verifier.AttestResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   error reading ak file at path"))
-	}
-	ak, err := tpm.LoadAK(akBytes)
+	ak, err := tpm.LoadAK(akbytes)
 	if err != nil {
 		glog.Errorf("ERROR:  error loading ak AK %v", err)
-		return &verifier.AttestResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error loading ak"))
+		return &verifier.AttestResponse{}, status.Errorf(codes.Internal, "ERROR:  error loading ak")
 	}
 	defer ak.Close(tpm)
 	var encryptedCredentials attest.EncryptedCredential
 	err = json.Unmarshal(in.EncryptedCredentials, &encryptedCredentials)
 	if err != nil {
 		glog.Errorf("ERROR:  error decoding encryptedCredentials %v", err)
-		return &verifier.AttestResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error decoding encryptedCredentials"))
+		return &verifier.AttestResponse{}, status.Errorf(codes.Internal, "ERROR:  error decoding encryptedCredentials")
 	}
 
 	secret, err := ak.ActivateCredential(tpm, encryptedCredentials)
 	if err != nil {
 		glog.Errorf("ERROR:  error activating Credential  AK %v", err)
-		return &verifier.AttestResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error activating Credentials"))
+		return &verifier.AttestResponse{}, status.Errorf(codes.Internal, "ERROR:  error activating Credentials")
 	}
 
 	return &verifier.AttestResponse{
@@ -227,37 +199,16 @@ func (s *server) Quote(ctx context.Context, in *verifier.QuoteRequest) (*verifie
 	defer s.mu.Unlock()
 	glog.V(2).Infof("======= Quote ========")
 
-	config := &attest.OpenConfig{
-		TPMVersion: attest.TPMVersion20,
-	}
-	tpm, err := attest.OpenTPM(config)
-	if err != nil {
-		glog.Errorf("ERROR:  opening tpm %v", err)
-		return &verifier.QuoteResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  could not get TPM"))
-	}
-	defer tpm.Close()
-
-	_, err = os.Stat(fmt.Sprintf("%s/%s.ak", *contextsPath, in.Uid))
-	if err != nil {
-		glog.Errorf("ERROR:  cannot Quote without Attestion Key; first run GetAK %v", err)
-		return &verifier.QuoteResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   cannot Quote without Attestion Key; first run GetAK"))
-	}
-
-	akBytes, err := os.ReadFile(fmt.Sprintf("%s/%s.ak", *contextsPath, in.Uid))
-	if err != nil {
-		glog.Errorf("ERROR:  error reading ak file at path %v", err)
-		return &verifier.QuoteResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   error reading ak file at path"))
-	}
-	ak, err := tpm.LoadAK(akBytes)
+	ak, err := tpm.LoadAK(akbytes)
 	if err != nil {
 		glog.Errorf("ERROR:  error loading ak AK %v", err)
-		return &verifier.QuoteResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error loading ak"))
+		return &verifier.QuoteResponse{}, status.Errorf(codes.Internal, "ERROR:  error loading ak")
 	}
 	defer ak.Close(tpm)
 	evtLog, err := os.ReadFile(*eventLogPath)
 	if err != nil {
 		glog.Errorf("     Error reading eventLog %v", err)
-		return &verifier.QuoteResponse{}, grpc.Errorf(codes.FailedPrecondition, fmt.Sprintf("Error reading eventLog: %v", err))
+		return &verifier.QuoteResponse{}, status.Errorf(codes.FailedPrecondition, fmt.Sprintf("Error reading eventLog: %v", err))
 	}
 
 	platformAttestation, err := tpm.AttestPlatform(ak, in.Nonce, &attest.PlatformAttestConfig{
@@ -265,14 +216,14 @@ func (s *server) Quote(ctx context.Context, in *verifier.QuoteRequest) (*verifie
 	})
 	if err != nil {
 		glog.Errorf("ERROR: creating Attestation %v", err)
-		return &verifier.QuoteResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  creating Attestation "))
+		return &verifier.QuoteResponse{}, status.Errorf(codes.Internal, "ERROR:  creating Attestation ")
 	}
 
 	platformAttestationBytes := new(bytes.Buffer)
 	err = json.NewEncoder(platformAttestationBytes).Encode(platformAttestation)
 	if err != nil {
 		glog.Errorf("ERROR: encoding platformAttestationBytes %v", err)
-		return &verifier.QuoteResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  encoding platformAttestationBytes "))
+		return &verifier.QuoteResponse{}, status.Errorf(codes.Internal, "ERROR:  encoding platformAttestationBytes ")
 	}
 
 	return &verifier.QuoteResponse{
@@ -280,398 +231,34 @@ func (s *server) Quote(ctx context.Context, in *verifier.QuoteRequest) (*verifie
 	}, nil
 }
 
-func (s *server) NewKey(ctx context.Context, in *verifier.NewKeyRequest) (*verifier.NewKeyResponse, error) {
+func (s *server) GetTLSKey(ctx context.Context, in *verifier.GetAttestedKeyRequest) (*verifier.GetAttestedKeyResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	glog.V(2).Infof("======= NewKey ========")
+	glog.V(2).Infof("======= GetTLSKey ========")
 
-	if s.running {
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   Server already running"))
-	}
-	config := &attest.OpenConfig{
-		TPMVersion: attest.TPMVersion20,
-	}
-	tpm, err := attest.OpenTPM(config)
+	nk, err := tpm.LoadKey(nkBytes)
 	if err != nil {
-		glog.Errorf("ERROR:  opening tpm %v", err)
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  could not get TPM"))
+		glog.Errorf("ERROR:  could not load tls key%v", err)
+		return &verifier.GetAttestedKeyResponse{}, status.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error tls key"))
 	}
-	defer tpm.Close()
-
-	_, err = os.Stat(fmt.Sprintf("%s/%s.ak", *contextsPath, in.Uid))
-	if err != nil {
-		glog.Errorf("ERROR:   cannot create NewKey without Attestion Key; first run GetAK %v", err)
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   cannot create NewKey without Attestion Key; first run GetAK"))
-	}
-
-	akBytes, err := os.ReadFile(fmt.Sprintf("%s/%s.ak", *contextsPath, in.Uid))
-	if err != nil {
-		glog.Errorf("ERROR:  error reading ak file at path %v", err)
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   error reading ak file at path"))
-	}
-	ak, err := tpm.LoadAK(akBytes)
-	if err != nil {
-		glog.Errorf("ERROR:  error loading ak AK %v", err)
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error loading ak"))
-	}
-	defer ak.Close(tpm)
-	// todo: support other keytypes,sizes
-	kConfig := &attest.KeyConfig{
-		Algorithm: attest.ECDSA,
-		Size:      256,
-	}
-	nk, err := tpm.NewKey(ak, kConfig)
-	if err != nil {
-		glog.Errorf("ERROR:  error creating key  %v", err)
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR: creating key"))
-	}
-
-	nkBytes, err := nk.Marshal()
-	if err != nil {
-		glog.Errorf("ERROR:  could not marshall newkey %v", err)
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.FailedPrecondition, fmt.Sprintf("ERROR:  could marshall newkey"))
-	}
-	if err := os.WriteFile(fmt.Sprintf("%s/%s.%s", *contextsPath, in.Uid, in.Kid), nkBytes, 0600); err != nil {
-		glog.Errorf("ERROR:  could not write ak to file %v", err)
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  writing AK to file"))
-	}
-
-	pubKey, ok := nk.Public().(*ecdsa.PublicKey)
-	if !ok {
-		glog.Errorf("Could not assert the public key to rsa public key")
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR: Could not assert the public key to rsa public key"))
-	}
-
-	pubkeybytes, err := x509.MarshalPKIXPublicKey(pubKey)
-	if err != nil {
-		glog.Errorf("Could not MarshalPKIXPublicKey rsa public key")
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR: Could not MarshalPKIXPublicKey rsa public key"))
-	}
-	pubkeyPem := pem.EncodeToMemory(
-		&pem.Block{
-			Type:  "PUBLIC KEY",
-			Bytes: pubkeybytes,
-		},
-	)
+	defer nk.Close()
 
 	keyCertificationBytes := new(bytes.Buffer)
 	err = json.NewEncoder(keyCertificationBytes).Encode(nk.CertificationParameters())
 	if err != nil {
 		glog.Errorf("ERROR: encoding keyCertificationBytes %v", err)
-		return &verifier.NewKeyResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  encoding keyCertificationBytes "))
+		return &verifier.GetAttestedKeyResponse{}, status.Errorf(codes.Internal, fmt.Sprintf("ERROR:  encoding keyCertificationBytes "))
 	}
 
-	return &verifier.NewKeyResponse{
-		Public:           []byte(pubkeyPem),
+	return &verifier.GetAttestedKeyResponse{
+		Certificate:      issuedTLSderBytes,
 		KeyCertification: keyCertificationBytes.Bytes(),
 	}, nil
 }
 
-func (s *server) Sign(ctx context.Context, in *verifier.SignRequest) (*verifier.SignResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	glog.V(2).Infof("======= Sign ========")
-
-	rwc, err := tpm2.OpenTPM(*tpmDevice)
-	if err != nil {
-		glog.Errorf("ERROR:  error opening TPM %v", err)
-		return &verifier.SignResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error opening TPM"))
-	}
-	defer rwc.Close()
-
-	config := &attest.OpenConfig{
-		TPMVersion: attest.TPMVersion20,
-	}
-	tpm, err := attest.OpenTPM(config)
-	if err != nil {
-		glog.Errorf("ERROR:  opening tpm %v", err)
-		return &verifier.SignResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  could not get TPM"))
-	}
-	defer tpm.Close()
-
-	_, err = os.Stat(fmt.Sprintf("%s/%s.%s", *contextsPath, in.Uid, in.Kid))
-	if err != nil {
-		glog.Errorf("ERROR:  cannot Sign without signing key Key; first run GetAK then NewKey %v", err)
-		return &verifier.SignResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:    cannot Sign without signing key Key; first run GetAK then NewKey "))
-	}
-
-	skBytes, err := os.ReadFile(fmt.Sprintf("%s/%s.%s", *contextsPath, in.Uid, in.Kid))
-	if err != nil {
-		glog.Errorf("ERROR:  error reading sigining key file at path %v", err)
-		return &verifier.SignResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   error reading signing file at path"))
-	}
-
-	var sig []byte
-
-	sk, err := tpm.LoadKey(skBytes)
-	if err != nil {
-		glog.Errorf("ERROR:  error loading signing key %v", err)
-		return &verifier.SignResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error loading signing key"))
-	}
-	defer sk.Close()
-
-	pk, err := sk.Private(sk.Public())
-	if err != nil {
-		glog.Errorf("ERROR:  error loading privatekey %v", err)
-		return &verifier.SignResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error loading signing privatekey"))
-	}
-
-	signer, ok := pk.(crypto.Signer)
-	if !ok {
-		glog.Errorf("ERROR:  error creating crypto.signer from privatekey %v", err)
-		return &verifier.SignResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error creating crypto.signer from privatekey"))
-	}
-
-	h := sha256.New()
-	h.Write(in.Data)
-	digest := h.Sum(nil)
-
-	sig, err = signer.Sign(rand.Reader, digest, crypto.SHA256)
-	if err != nil {
-		glog.Errorf("ERROR:  error signing %v", err)
-		return &verifier.SignResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:  error signing"))
-	}
-
-	return &verifier.SignResponse{
-		Signed: sig,
-	}, nil
-}
-
-func (s *server) StartTLS(ctx context.Context, in *verifier.StartTLSRequest) (*verifier.StartTLSResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	glog.V(2).Infof("======= StartTLS ========")
-
-	if s.running {
-		return &verifier.StartTLSResponse{}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   Server already running"))
-	}
-
-	// todo: improve how this is launched.
-	//  ideally, this should launch in background and the startTLS api call should return
-	//  the status of the server back;  I'm using the errorgoups here to aggregate
-	//  any problems with the startup but these errors are not caught outside of the routine
-	errs, ctx := errgroup.WithContext(ctx)
-	errs.Go(func() error {
-
-		router := mux.NewRouter()
-		router.Methods(http.MethodGet).Path("/").HandlerFunc(gethandler)
-
-		config := &attest.OpenConfig{
-			TPMVersion: attest.TPMVersion20,
-		}
-		tpm, err := attest.OpenTPM(config)
-		if err != nil {
-			glog.Errorf("ERROR:  opening tpm %v", err)
-			return fmt.Errorf("ERROR:  could not get TPM")
-		}
-		defer tpm.Close()
-
-		_, err = os.Stat(fmt.Sprintf("%s/%s.%s", *contextsPath, in.Uid, in.Kid))
-		if err != nil {
-			glog.Errorf("ERROR:  cannot Sign without signing key Key; first run GetAK then NewKey %v", err)
-			return fmt.Errorf("ERROR:    cannot Sign without signing key Key; first run GetAK then NewKey ")
-		}
-
-		skBytes, err := os.ReadFile(fmt.Sprintf("%s/%s.%s", *contextsPath, in.Uid, in.Kid))
-		if err != nil {
-			glog.Errorf("ERROR:  error reading sigining key file at path %v", err)
-			return fmt.Errorf("ERROR:   error reading signing file at path")
-		}
-
-		sk, err := tpm.LoadKey(skBytes)
-		if err != nil {
-			glog.Errorf("ERROR:  error loading signing key %v", err)
-			return fmt.Errorf("ERROR:  error loading signing key")
-		}
-		defer sk.Close()
-
-		signer, err := sk.Private(sk.Public())
-		if err != nil {
-			glog.Errorf("  error loading signer %v", err)
-			return fmt.Errorf("ERROR:  error loading signer %v", err)
-		}
-
-		glog.V(2).Infof("        Issuing Cert ========")
-
-		var notBefore time.Time
-		notBefore = time.Now()
-
-		notAfter := notBefore.Add(time.Hour * 24 * 365)
-
-		serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-		serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-		if err != nil {
-			glog.Errorf("ERROR: Failed to generate serial number: %v", err)
-			return fmt.Errorf("ERROR:  Failed to generate serial number:")
-		}
-
-		issuerCertBytes, err := ioutil.ReadFile(*issuerCert)
-		if err != nil {
-			glog.Errorf("Error Reading root ca %v", err)
-			return fmt.Errorf("Error Reading root ca %v", err)
-		}
-
-		rcblock, _ := pem.Decode(issuerCertBytes)
-
-		rcert, err := x509.ParseCertificate(rcblock.Bytes)
-		if err != nil {
-			glog.Errorf("ERROR:  error loading issuerkey %v", err)
-			return fmt.Errorf("ERROR:  error loading issuerkey")
-		}
-		issuerKeyBytes, err := ioutil.ReadFile(*issuerKey)
-		if err != nil {
-			glog.Errorf("ERROR:  error loading issuerkey %v", err)
-			return fmt.Errorf("ERROR:  error loading issuerkey")
-		}
-		rblock, _ := pem.Decode(issuerKeyBytes)
-		r, err := x509.ParsePKCS8PrivateKey(rblock.Bytes)
-		if err != nil {
-			glog.Errorf("ERROR:  error loading privatekey %v", err)
-			return fmt.Errorf("ERROR:  error loading signing privatekey")
-		}
-
-		// simulate creating a CSR to send to some CA
-		var csrtemplate = x509.CertificateRequest{
-			Subject: pkix.Name{
-				Organization:       []string{"Acme Co"},
-				OrganizationalUnit: []string{"Enterprise"},
-				Locality:           []string{"Mountain View"},
-				Province:           []string{"California"},
-				Country:            []string{"US"},
-				CommonName:         "foo",
-			},
-			DNSNames:           []string{*httpServerName},
-			SignatureAlgorithm: x509.ECDSAWithSHA256,
-		}
-
-		csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &csrtemplate, signer)
-		if err != nil {
-			glog.Errorf("ERROR:  error creating csr %v", err)
-			return fmt.Errorf("ERROR:  error creating csr")
-		}
-
-		csrpemdata := pem.EncodeToMemory(
-			&pem.Block{
-				Type:  "CERTIFICATE REQUEST",
-				Bytes: csrBytes,
-			},
-		)
-		glog.V(2).Infof("      CSR \n%s\n", string(csrpemdata))
-
-		// simulate marshal/unmarshalling the csr on whatever CA you have.
-		//  The CA is should be something the verifier trusts.
-		//  Here the remote CA is local, just pretend we issue a csr and get it signed by that CA.
-		// in an alternative flow, the CSR here could even be sent back to each verifier...the verifier
-		//  would then issue the x509 and then return to the attestor.
-		//   the attestor would startTLS  and listening using that (ofcourse that flow requires new methods/flows)
-		clientCSR, err := x509.ParseCertificateRequest(csrBytes)
-		if err != nil {
-			glog.Errorf("ERROR:  error ParseCertificateRequest %v", err)
-			return fmt.Errorf("ERROR:  error ParseCertificateRequest")
-		}
-
-		// now use certain fields within the CSR and the overall template to issue the cert on the CA
-		template := x509.Certificate{
-			SerialNumber: serialNumber,
-			Subject: pkix.Name{
-				Organization:       []string{"Acme Co"},
-				OrganizationalUnit: []string{"Enterprise"},
-				Locality:           []string{"Mountain View"},
-				Province:           []string{"California"},
-				Country:            []string{"US"},
-				CommonName:         clientCSR.Subject.CommonName, // from CSR
-			},
-			DNSNames:              clientCSR.DNSNames, // from CSR
-			NotBefore:             notBefore,
-			NotAfter:              notAfter,
-			KeyUsage:              x509.KeyUsageDigitalSignature,
-			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-			BasicConstraintsValid: true,
-			IsCA:                  false,
-		}
-
-		// now issue the cert; the attestor will use this cert to startup the
-		derBytes, err := x509.CreateCertificate(rand.Reader, &template, rcert, clientCSR.PublicKey, r)
-		if err != nil {
-			glog.Errorf("ERROR:  Failed to create certificate: %s\n", err)
-			return fmt.Errorf("ERROR:  Failed to create certificate: %s\n", err)
-		}
-
-		p, err := x509.ParseCertificate(derBytes)
-		if err != nil {
-			glog.Errorf("ERROR:  Failed to  parse certificate: %s", err)
-			return fmt.Errorf("ERROR:  Failed to  parse certificate: %s", err)
-		}
-		glog.V(2).Infof("        cert Issuer %s\n", p.Issuer)
-		c := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-		glog.V(2).Infof("        Issued Certificate ========\n%s\n", c)
-
-		pubkey_bytes, err := x509.MarshalPKIXPublicKey(p.PublicKey)
-		if err != nil {
-			glog.Errorf("ERROR:  Failed to marshall certificate publcikey: %s", err)
-			return fmt.Errorf("ERROR:  Failed to marshall certificate publcikey: %s", err)
-		}
-		kpem := pem.EncodeToMemory(
-			&pem.Block{
-				Type:  "PUBLIC KEY",
-				Bytes: pubkey_bytes,
-			},
-		)
-
-		// pretend the CSR was sent to a CA and the response was provided here
-		//  the attestor can then startup TLS using this.
-		//  Save the cert that was issued by the CA (or simulated remote CA)
-		if err := os.WriteFile(fmt.Sprintf("%s/%s.%s-tls.crt", *contextsPath, in.Uid, in.Kid), c, 0600); err != nil {
-			glog.Errorf("ERROR:  could not write ak to file %v", err)
-			return fmt.Errorf("ERROR:  writing cert to file")
-		}
-
-		glog.V(2).Infof("        Issued certificate tied to PubicKey ========\n%s\n", kpem)
-
-		tlsCrt := tls.Certificate{
-			Certificate: [][]byte{p.Raw},
-			Leaf:        p,
-			PrivateKey:  signer,
-		}
-
-		var server *http.Server
-		server = &http.Server{
-			Addr:    *applicationPort,
-			Handler: router,
-			TLSConfig: &tls.Config{
-				Certificates: []tls.Certificate{tlsCrt},
-			},
-		}
-
-		http2.ConfigureServer(server, &http2.Server{})
-		glog.V(2).Infof("Starting Server..")
-
-		lis, err := net.Listen("tcp", *applicationPort)
-		if err != nil {
-			glog.Errorf("        Error Listening \n%v\n", err)
-			return fmt.Errorf("ERROR: listening: %v", err)
-		}
-		s.running = true
-		server.ServeTLS(lis, "", "")
-
-		return nil
-
-	})
-
-	time.Sleep(1000 * time.Millisecond)
-
-	// if err := errs.Wait(); err != nil {
-	// 	glog.Errorf("ERROR:  error startingTLS %v", err)
-	// 	return &verifier.StartTLSResponse{Status: false}, grpc.Errorf(codes.Internal, fmt.Sprintf("ERROR:   error startingTLS %v", err))
-	// }
-	return &verifier.StartTLSResponse{
-		Status: s.running,
-	}, nil
-
-}
-
 func gethandler(w http.ResponseWriter, r *http.Request) {
-	glog.V(2).Infof("Inbound HTTP request..")
+	val := r.Context().Value(contextKey("event")).(event)
+	glog.V(10).Infof("Inbound HTTP request from: %s", val.PeerIP)
 	fmt.Fprint(w, "ok")
 }
 
@@ -687,41 +274,22 @@ func main() {
 	}
 
 	var err error
-	rwc, err := tpm2.OpenTPM(*tpmDevice)
-	if err != nil {
-		glog.Fatalf("can't open TPM %q: %v", tpmDevice, err)
-	}
-
-	totalHandles := 0
-	for _, handleType := range handleNames["all"] {
-		handles, err := client.Handles(rwc, handleType)
-		if err != nil {
-			glog.Fatalf("getting handles: %v", err)
-		}
-		for _, handle := range handles {
-			if err = tpm2.FlushContext(rwc, handle); err != nil {
-				glog.Fatalf("flushing handle 0x%x: %v", handle, err)
-			}
-			glog.V(10).Infof("Handle 0x%x flushed\n", handle)
-			totalHandles++
-		}
-	}
-	if err := rwc.Close(); err != nil {
-		glog.Fatalf("can't close TPM %q: %v", tpmDevice, err)
-	}
-	glog.V(2).Info("Getting EKCert reset")
+	glog.V(2).Info("Getting EKCert")
 
 	config := &attest.OpenConfig{
 		TPMVersion: attest.TPMVersion20,
 	}
-	tpm, err := attest.OpenTPM(config)
+	tpm, err = attest.OpenTPM(config)
 	if err != nil {
-		glog.Fatalf("error opening TPM %v", err)
+		glog.Errorf("error opening TPM %v", err)
+		os.Exit(1)
 	}
+	defer tpm.Close()
 
 	eks, err := tpm.EKs()
 	if err != nil {
-		glog.Fatalf("error getting EK %v", err)
+		glog.Errorf("error getting EK %v", err)
+		os.Exit(1)
 	}
 
 	for _, e := range eks {
@@ -730,11 +298,275 @@ func main() {
 		}
 	}
 
-	ek = eks[0]
+	if len(eks) == 0 {
+		glog.Error("error no EK found")
+		os.Exit(1)
+	}
+
+	// use the  ek at 0 for now...
+	ek = &eks[0]
+
+	if ek.Public == nil {
+		glog.Error("error no Public not found")
+		os.Exit(1)
+	}
+
+	ekpubBytes, err = x509.MarshalPKIXPublicKey(ek.Public)
+	if err != nil {
+		glog.Errorf("ERROR:  could  marshall public key %v", err)
+		os.Exit(1)
+	}
+
+	if ek.Certificate != nil {
+		ekCert = ek.Certificate
+	}
+	// generate the attestation key
+	// TODO: see how to get the GCE signed attestation key:
+	// https://github.com/salrashid123/gcp-vtpm-ek-ak
+	akConfig := &attest.AKConfig{
+		Parent: &attest.ParentKeyConfig{
+			Algorithm: attest.RSA,
+			Handle:    0x81000001, // srk https://trustedcomputinggroup.org/wp-content/uploads/TCG-TPM-v2.0-Provisioning-Guidance-Published-v1r1.pdf
+		},
+	}
+	//akConfig := &attest.AKConfig{}
+	ak, err := tpm.NewAK(akConfig)
+	if err != nil {
+		glog.Errorf("ERROR:  could not get AK %v", err)
+		os.Exit(1)
+	}
+
+	akbytes, err = ak.Marshal()
+	if err != nil {
+		glog.Errorf("ERROR:  could marshall AK %v", err)
+		os.Exit(1)
+	}
+
+	// now crate the TLS EC key on the TPM
+	kConfig := &attest.KeyConfig{
+		Algorithm: attest.ECDSA,
+		Size:      256,
+	}
+	nk, err := tpm.NewKey(ak, kConfig)
+	if err != nil {
+		glog.Errorf("ERROR:  error creating key  %v", err)
+		os.Exit(1)
+	}
+	err = ak.Close(tpm)
+	if err != nil {
+		glog.Errorf("ERROR:  error closing ak  %v", err)
+		os.Exit(1)
+	}
+
+	nkBytes, err = nk.Marshal()
+	if err != nil {
+		glog.Errorf("ERROR:  could not marshall newkey %v", err)
+		os.Exit(1)
+	}
+
+	pubKey, ok := nk.Public().(*ecdsa.PublicKey)
+	if !ok {
+		glog.Errorf("Could not assert the public key to ec public key")
+		os.Exit(1)
+	}
+
+	pubkeybytes, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		glog.Errorf("Could not MarshalPKIXPublicKey ec public key")
+		os.Exit(1)
+	}
+	pubkeyPem := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "PUBLIC KEY",
+			Bytes: pubkeybytes,
+		},
+	)
+
+	glog.V(2).Infof("Generated ECC Public %s", string(pubkeyPem))
+
+	// **********************************************************
+
+	// extract the crypto.Signer from the TLS key
+
+	signer, err := nk.Private(nk.Public())
+	if err != nil {
+		glog.Errorf("ERROR: getting crypto.Signer from generated key %v", err)
+		os.Exit(1)
+	}
+
+	// generate a CSR
+	glog.V(10).Infof("        Issuing Cert ========")
+
+	notBefore := time.Now()
+	notAfter := notBefore.Add(time.Hour * 24) // valid for a day
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		glog.Errorf("ERROR: Failed to generate serial number: %v", err)
+		os.Exit(1)
+	}
+
+	issuerCertBytes, err := os.ReadFile(*issuerCert)
+	if err != nil {
+		glog.Errorf("Error Reading root ca %v", err)
+		os.Exit(1)
+	}
+
+	rcblock, _ := pem.Decode(issuerCertBytes)
+
+	rcert, err := x509.ParseCertificate(rcblock.Bytes)
+	if err != nil {
+		glog.Errorf("ERROR:  error loading issuercertificate %v", err)
+		os.Exit(1)
+	}
+	issuerKeyBytes, err := os.ReadFile(*issuerKey)
+	if err != nil {
+		glog.Errorf("ERROR:  error loading issuerkey %v", err)
+		os.Exit(1)
+	}
+	rblock, _ := pem.Decode(issuerKeyBytes)
+	r, err := x509.ParsePKCS8PrivateKey(rblock.Bytes)
+	if err != nil {
+		glog.Errorf("ERROR:  error loading privatekey %v", err)
+		os.Exit(1)
+	}
+
+	// simulate creating a CSR to send to some CA
+	var csrtemplate = x509.CertificateRequest{
+		Subject: pkix.Name{
+			Organization:       []string{"Acme Co"},
+			OrganizationalUnit: []string{"Enterprise"},
+			Locality:           []string{"Mountain View"},
+			Province:           []string{"California"},
+			Country:            []string{"US"},
+			CommonName:         "foo",
+		},
+		DNSNames:           []string{*httpServerName},
+		SignatureAlgorithm: x509.ECDSAWithSHA256,
+	}
+
+	// create the CSR but note the private key is the EC keys's "signer"
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &csrtemplate, signer)
+	if err != nil {
+		glog.Errorf("ERROR:  error creating csr %v", err)
+		os.Exit(1)
+	}
+
+	csrpemdata := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "CERTIFICATE REQUEST",
+			Bytes: csrBytes,
+		},
+	)
+	glog.V(20).Infof("      CSR \n%s\n", string(csrpemdata))
+
+	// simulate marshal/unmarshalling the csr on whatever CA you have.
+	//  The CA is should be something the verifier trusts.
+	//  Here the remote CA is local, just pretend we issue a csr and get it signed by that CA.
+	// in an alternative flow, the CSR here could even be sent back to each verifier...the verifier
+	//  would then issue the x509 and then return to the attestor.
+	//   the attestor would startTLS  and listening using that (ofcourse that flow requires new methods/flows)
+	clientCSR, err := x509.ParseCertificateRequest(csrBytes)
+	if err != nil {
+		glog.Errorf("ERROR:  error ParseCertificateRequest %v", err)
+		os.Exit(1)
+	}
+
+	// now use certain fields within the CSR and the overall template to issue the cert on the CA
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization:       []string{"Acme Co"},
+			OrganizationalUnit: []string{"Enterprise"},
+			Locality:           []string{"Mountain View"},
+			Province:           []string{"California"},
+			Country:            []string{"US"},
+			CommonName:         clientCSR.Subject.CommonName, // from CSR
+		},
+		DNSNames:              clientCSR.DNSNames, // from CSR
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+	}
+
+	// now issue the cert using the local CA
+	issuedTLSderBytes, err = x509.CreateCertificate(rand.Reader, &template, rcert, clientCSR.PublicKey, r)
+	if err != nil {
+		glog.Errorf("ERROR:  Failed to create certificate: %s\n", err)
+		os.Exit(1)
+	}
+
+	p, err := x509.ParseCertificate(issuedTLSderBytes)
+	if err != nil {
+		glog.Errorf("ERROR:  Failed to  parse certificate: %s", err)
+		os.Exit(1)
+	}
+	glog.V(10).Infof("        cert Issuer %s\n", p.Issuer)
+
+	c := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuedTLSderBytes})
+	glog.V(10).Infof("        Issued Certificate ========\n%s\n", c)
+
+	pubkey_bytes, err := x509.MarshalPKIXPublicKey(p.PublicKey)
+	if err != nil {
+		glog.Errorf("ERROR:  Failed to marshall certificate publcikey: %s", err)
+		os.Exit(1)
+	}
+	kpem := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "PUBLIC KEY",
+			Bytes: pubkey_bytes,
+		},
+	)
+
+	glog.V(2).Infof("        Issued certificate tied to PubicKey ========\n%s\n", kpem)
+
+	// use the EC key to launch the HTTPs server
+	// again, note the privatekey is the signer
+	ctx := context.Background()
+	tlsCrt := tls.Certificate{
+		Certificate: [][]byte{p.Raw},
+		Leaf:        p,
+		PrivateKey:  signer,
+	}
+
+	errs, _ := errgroup.WithContext(ctx)
+	errs.Go(func() error {
+		router := mux.NewRouter()
+		router.Methods(http.MethodGet).Path("/").HandlerFunc(gethandler)
+		server := &http.Server{
+			Addr:    *applicationPort,
+			Handler: eventsMiddleware(router),
+			TLSConfig: &tls.Config{
+				Certificates: []tls.Certificate{tlsCrt},
+			},
+		}
+
+		http2.ConfigureServer(server, &http2.Server{})
+		glog.V(2).Infof("Starting HTTP Server on port %s", *applicationPort)
+
+		lis, err := net.Listen("tcp", *applicationPort)
+		if err != nil {
+			glog.Errorf("        Error Listening \n%v\n", err)
+			return fmt.Errorf("ERROR: listening: %v", err)
+		}
+
+		return server.ServeTLS(lis, "", "")
+	})
+
+	// if err := errs.Wait(); err != nil {
+	// 	glog.Errorf("ERROR:  error startingTLS %v", err)
+	// 	return &verifier.StartTLSResponse{Status: false}, status.Errorf(codes.Internal, fmt.Sprintf("ERROR:   error startingTLS %v", err))
+	// }
+	// launch grpc attestation server
 
 	defaultCerts, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 	if err != nil {
-		glog.Fatalf("failed to create default certs: %v", err)
+		glog.Errorf("failed to create default certs: %v", err)
+		os.Exit(1)
 	}
 
 	tlsConfig := &tls.Config{
@@ -743,7 +575,8 @@ func main() {
 	ce := credentials.NewTLS(tlsConfig)
 	lis, err := net.Listen("tcp", *grpcport)
 	if err != nil {
-		glog.Fatalf("failed to listen: %v", err)
+		glog.Errorf("failed to listen: %v", err)
+		os.Exit(1)
 	}
 
 	sopts := []grpc.ServerOption{grpc.MaxConcurrentStreams(10)}
@@ -754,6 +587,5 @@ func main() {
 	verifier.RegisterVerifierServer(s, &server{})
 
 	glog.V(2).Infof("Starting gRPC server on port %v", *grpcport)
-	mrnd.Seed(time.Now().UnixNano())
 	s.Serve(lis)
 }

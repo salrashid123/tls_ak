@@ -8,11 +8,16 @@ service Verifier {
   rpc GetEK (GetEKRequest) returns (GetEKResponse) { }
   rpc GetAK (GetAKRequest) returns (GetAKResponse) { }
   rpc Attest (AttestRequest) returns (AttestResponse) { }
-  rpc Quote (QuoteRequest) returns (QuoteResponse) { }
-  rpc NewKey (NewKeyRequest) returns (NewKeyResponse) { }
-  rpc Sign (SignRequest) returns (SignResponse) { }
-  rpc StartTLS (StartTLSRequest) returns (StartTLSResponse) { }
+  rpc Quote (QuoteRequest) returns (QuoteResponse) { } 
+  rpc GetTLSKey (GetAttestedKeyRequest) returns (GetAttestedKeyResponse) { }   
 }
+
+enum KeyType {
+  TLS = 0;
+  Signature = 1;
+  Encryption = 2;
+  AES = 3;
+}  
 
 
 message GetEKRequest {}
@@ -22,17 +27,14 @@ message GetEKResponse {
   bytes ekCert = 2;
 }
 
-message GetAKRequest {
-  string uid = 1;
-}
+message GetAKRequest {}
 
 message GetAKResponse {
-  bytes ak = 1;
+  bytes attestation_parameters = 1;
 }
 
 message AttestRequest {
-  string uid = 1;
-  bytes encryptedCredentials = 2;
+  bytes encryptedCredentials = 1;
 }
 
 message AttestResponse {
@@ -40,40 +42,20 @@ message AttestResponse {
 }
 
 message QuoteRequest {
-  string uid = 1;
-  bytes nonce = 2;
+  bytes nonce = 1;
 }
 
 message QuoteResponse {
   bytes platformAttestation = 1;
 }
 
-message NewKeyRequest {
-  string uid = 1;
-  string kid = 2;  
+message GetAttestedKeyRequest {
+  string kid = 1;
+  KeyType key_type = 2;
 }
 
-message NewKeyResponse {
-  bytes public = 1;
+message GetAttestedKeyResponse {
+  bytes certificate = 1;
   bytes keyCertification = 2;
 }
 
-message SignRequest {
-  string uid = 1;
-  string kid = 2;
-  bytes data = 3;
-}
-
-message SignResponse {
-  bytes signed = 1;
-}
-
-message StartTLSRequest {
-  string uid = 1;
-  string kid = 2;
-}
-
-message StartTLSResponse {
-  bool status = 1;
-  string port = 2;
-}
