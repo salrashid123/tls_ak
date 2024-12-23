@@ -44,7 +44,8 @@ Create a VM
 ```bash
 gcloud compute instances create attestor   \
    --zone=us-central1-a --machine-type=n2d-standard-2 --no-service-account --no-scopes \
-      --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud --maintenance-policy=MIGRATE --min-cpu-platform="AMD Milan"  --confidential-compute  --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring
+      --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud --maintenance-policy=MIGRATE --min-cpu-platform="AMD Milan"  --confidential-compute-type=SEV \
+      --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring
 
 ## allow grpc
 gcloud compute firewall-rules create allow-tpm-verifier  --action allow --direction INGRESS   --source-ranges 0.0.0.0/0    --rules tcp:50051
@@ -66,6 +67,19 @@ export ATTESTOR_ADDRESS=34.30.250.78
 # alternatively, you can use go-tpm's pcrread: https://github.com/salrashid123/tpm2/tree/master/pcr_utils
 ```
 
+
+Now, since we're on GCP, get the EK Signing and intermediate certificates.  For other manufacturers, you can usually lookup the manufacturers CA out of band, eg for `CN=STM TPM EK Intermediate CA 06,O=STMicroelectronics NV,C=CH` they're listed [here](https://www.st.com/resource/en/technical_note/tn1330-st-trusted-platform-module-tpm-endorsement-key-ek-certificates-stmicroelectronics.pdf)
+
+```bash
+## get the EK
+gcloud compute instances get-shielded-identity attestor --format=json --zone=us-central1-a | jq -r '.encryptionKey.ekCert' > certs/ekcert.pem
+
+## get the intermediate from the ek
+curl -s $(openssl x509 -in certs/ekcert.pem -noout -text | grep -Po "((?<=CA Issuers - URI:)http://.*)$") | openssl x509 -inform DER -outform PEM -out certs/ek_intermediate.pem
+
+## get the root from the intermediate
+curl -s $(openssl x509 -in certs/ek_intermediate.pem -noout -text | grep -Po "((?<=CA Issuers - URI:)http://.*)$") | openssl x509 -inform DER -outform PEM -out certs/ek_root.pem
+```
 
 
 #### Attestor
@@ -358,6 +372,17 @@ $ gcloud compute instances get-shielded-identity attestor
 $ gcloud compute instances get-shielded-identity attestor --format=json | jq -r '.encryptionKey.ekCert' > ekcert.pem
 $ gcloud compute instances get-shielded-identity attestor --format=json | jq -r '.signingKey.ekCert' > akcert.pem
 
+## get the EK
+gcloud compute instances get-shielded-identity attestor --format=json --zone=us-central1-a | jq -r '.encryptionKey.ekCert' > certs/ekcert.pem
+
+## get the intermediate from the ek
+curl -s $(openssl x509 -in certs/ekcert.pem -noout -text | grep -Po "((?<=CA Issuers - URI:)http://.*)$") | openssl x509 -inform DER -outform PEM -out certs/ek_intermediate.pem
+
+## get the root from the intermediate
+curl -s $(openssl x509 -in certs/ek_intermediate.pem -noout -text | grep -Po "((?<=CA Issuers - URI:)http://.*)$") | openssl x509 -inform DER -outform PEM -out certs/ek_root.pem
+
+## or by hand, (the URLs are encoded into the ekcert so your values will be different)
+
 $ wget http://privateca-content-633beb94-0000-25c1-a9d7-001a114ba6e8.storage.googleapis.com/c59a22589ab43a57e3a4/ca.crt -O ek_intermediate.crt
 $ wget http://privateca-content-62d71773-0000-21da-852e-f4f5e80d7778.storage.googleapis.com/032bf9d39db4fa06aade/ca.crt -O ek_root.crt 
 $ openssl x509 -inform der -in ek_intermediate.crt -out ek_intermediate.pem
@@ -394,8 +419,6 @@ Certificate:
                 CA Issuers - URI:http://privateca-content-633beb94-0000-25c1-a9d7-001a114ba6e8.storage.googleapis.com/c59a22589ab43a57e3a4/ca.crt
 
 ```
-
-As for RSA keys, it turns out the for TPMs, [rsa.PSSSaltLengthAuto](https://pkg.go.dev/crypto/rsa#PSSOptions) is used but whats provided via go1.17+ during TLS1.3 is  [PSSSaltLengthEqualsHash](https://pkg.go.dev/crypto/rsa#pkg-constants)...meaning its difficult to make RSA to work at the moment with go and TLS specifically. (for ref, see [tpm2-pkcs11/issues/417](https://github.com/tpm2-software/tpm2-pkcs11/issues/417))
 
 #### Local Testing
 
