@@ -483,14 +483,9 @@ func main() {
 		//  then prepends the null pcr value (zeros) to the cert's hash, then hashes all that
 		//  what your'e basically left with a value which should match what the server sent down as
 		//  the value for *encodingPCR
-		pubkeybytes, err := x509.MarshalPKIXPublicKey(tlsECCPub)
-		if err != nil {
-			glog.Errorf("Could not MarshalPKIXPublicKey ec public key")
-			os.Exit(1)
-		}
 
 		khasher := sha256.New()
-		khasher.Write(pubkeybytes)
+		khasher.Write(remoteTLScert.Raw)
 		tlsCertificateHash := khasher.Sum(nil)
 
 		phasher := sha256.New()
