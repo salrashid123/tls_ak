@@ -49,9 +49,9 @@ var (
 	grpcServerName       = flag.String("grpcservername", "attestor.domain.com", "SNI for grpc server")
 	httpServerName       = flag.String("httpservername", "echo.domain.com", "SNI for http server")
 	expectedPCRMapSHA256 = flag.String("expectedPCRMapSHA256", "0:d0c70a9310cd0b55767084333022ce53f42befbb69c059ee6c0a32766f160783", "Sealing and Quote PCRMap (as comma separated key:value).  pcr#:sha256,pcr#sha256.  Default value uses pcr0:sha256")
-
-	ekRootCA         = flag.String("ekrootCA", "certs/ek_root.pem", "EK rootsCA")
-	ekIntermediateCA = flag.String("ekintermediateCA", "certs/ek_intermediate.pem", "EK intermediate CA")
+	encodingPCR          = flag.Uint("encodingPCR", 0, "PCR to extend with TLS public key hash")
+	ekRootCA             = flag.String("ekrootCA", "certs/ek_root.pem", "EK rootsCA")
+	ekIntermediateCA     = flag.String("ekintermediateCA", "certs/ek_intermediate.pem", "EK intermediate CA")
 )
 
 func main() {
@@ -357,6 +357,7 @@ func main() {
 		}
 	}
 
+	var encodingPCRValue []byte
 	for _, p := range serverPlatformAttestationParameter.PCRs {
 		glog.V(20).Infof("     PCR: %d, verified: %t value: %s", p.Index, p.QuoteVerified(), hex.EncodeToString((p.Digest)))
 		if p.DigestAlg == crypto.SHA256 {
@@ -367,6 +368,10 @@ func main() {
 					os.Exit(1)
 				}
 			}
+			// now stash pcr23's value, this is the bank where the value was extended with the certificates fingerprint
+			if p.Index == int(*encodingPCR) {
+				encodingPCRValue = p.Digest
+			}
 		}
 	}
 
@@ -375,6 +380,12 @@ func main() {
 	if err != nil {
 		glog.Errorf("Quote Parsing EventLog Failed: %v", err)
 		os.Exit(1)
+	}
+
+	for _, e := range el.Events(attest.HashSHA256) {
+		glog.V(60).Infof("Event Index: %d", e.Index)
+		glog.V(60).Infof("   Event Type: %s", e.Type)
+		glog.V(60).Infof("   Event: %s", string(e.Data))
 	}
 
 	sb, err := attest.ParseSecurebootState(el.Events(attest.HashSHA1))
@@ -428,6 +439,79 @@ func main() {
 		glog.Errorf("Key Verification error %v", err)
 		os.Exit(1)
 	}
+
+	decodedTPMNTPublic, err := tpm2.DecodePublic(keyCertificationParameter.Public)
+	if err != nil {
+		glog.Errorf("error parsing TPM public key structure: %v", err)
+		os.Exit(1)
+	}
+
+	tlsPubKey, err := decodedTPMNTPublic.Key()
+	if err != nil {
+		glog.Errorf("error parsing getting public key for TLS Key: %v", err)
+		os.Exit(1)
+	}
+	tlsECCPub, ok := tlsPubKey.(*ecdsa.PublicKey)
+	if !ok {
+		glog.Errorf("error converting tls public key to ec key: %v", err)
+		os.Exit(1)
+	}
+
+	// certifyPubbytes, err := x509.MarshalPKIXPublicKey(tlsECCPub)
+	// if err != nil {
+	// 	glog.Errorf("ERROR:  Failed to marshall certificate publcikey: %s", err)
+	// 	os.Exit(1)
+	// }
+	// certifyPEM := pem.EncodeToMemory(
+	// 	&pem.Block{
+	// 		Type:  "PUBLIC KEY",
+	// 		Bytes: certifyPubbytes,
+	// 	},
+	// )
+
+	if tlsECCPub.Equal(remoteTLScert.PublicKey) {
+		glog.V(5).Info("     certified public key matches public key in x509 certificate")
+	} else {
+		glog.Errorf("ERROR:  certified public key does not matches public key in x509 certificate")
+		os.Exit(1)
+	}
+
+	if *encodingPCR != 0 {
+		// By convention, the server reset PCR bank *encodingPCR (eg, pcr=23) to zeros
+		//  after that, it extended the pcr value using the hash of the issued TLS x509 certificate.
+		//  what the following does is hashes the certificate
+		//  then prepends the null pcr value (zeros) to the cert's hash, then hashes all that
+		//  what your'e basically left with a value which should match what the server sent down as
+		//  the value for *encodingPCR
+		pubkeybytes, err := x509.MarshalPKIXPublicKey(tlsECCPub)
+		if err != nil {
+			glog.Errorf("Could not MarshalPKIXPublicKey ec public key")
+			os.Exit(1)
+		}
+
+		khasher := sha256.New()
+		khasher.Write(pubkeybytes)
+		tlsCertificateHash := khasher.Sum(nil)
+
+		phasher := sha256.New()
+		pcrEmpty, err := hex.DecodeString("0000000000000000000000000000000000000000000000000000000000000000")
+		if err != nil {
+			glog.Errorf("Could create empty pcr value")
+			os.Exit(1)
+		}
+		cb := append(pcrEmpty, tlsCertificateHash...)
+		phasher.Write(cb)
+		pcrHash := phasher.Sum(nil)
+
+		glog.V(30).Infof("     TLS ECC Public Hash %s", hex.EncodeToString((tlsCertificateHash)))
+		glog.V(30).Infof("     Encoding PCR Value Public Hash %s", hex.EncodeToString((encodingPCRValue)))
+		glog.V(30).Infof("     Calculated PCR Value  %s", hex.EncodeToString((pcrHash)))
+
+		if hex.EncodeToString((encodingPCRValue)) != hex.EncodeToString((pcrHash)) {
+			glog.Errorf("hash of pcr=[%d] incorrect, got [%s], expected [%s]", *encodingPCR, hex.EncodeToString((encodingPCRValue)), hex.EncodeToString((pcrHash)))
+			os.Exit(1)
+		}
+	}
 	glog.V(5).Infof("     TLS key verified")
 	glog.V(5).Infof("=============== end NewKey ===============")
 
@@ -441,7 +525,7 @@ func main() {
 	}
 
 	roots := x509.NewCertPool()
-	ok := roots.AppendCertsFromPEM([]byte(rootPEM))
+	ok = roots.AppendCertsFromPEM([]byte(rootPEM))
 	if !ok {
 		glog.Errorf("failed to parse root certificate")
 		os.Exit(1)

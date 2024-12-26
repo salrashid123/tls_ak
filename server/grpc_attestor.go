@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net/http"
+	"slices"
 	"time"
 
 	"flag"
@@ -30,6 +34,10 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/google/go-attestation/attest"
+	"github.com/google/go-tpm-tools/simulator"
+	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/google/go-tpm/tpmutil"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
@@ -45,8 +53,9 @@ var (
 	tlsKey          = flag.String("tlsKey", "certs/server.key", "tls Key")
 	issuerCert      = flag.String("issuerCert", "certs/issuer_ca.crt", "tls Certificate")
 	issuerKey       = flag.String("issuerKey", "certs/issuer_ca.key", "tls Key")
+	encodingPCR     = flag.Uint("encodingPCR", 0, "PCR to extend with TLS public key hash")
 	eventLogPath    = flag.String("eventLogPath", "/sys/kernel/security/tpm0/binary_bios_measurements", "Path to the eventlog")
-	tpmDevice       = flag.String("tpmDevice", "/dev/tpm0", "TPMPath")
+	tpmDevice       = flag.String("tpmDevice", "/dev/tpmrm0", "TPMPath")
 
 	httpServerName = flag.String("httpservername", "echo.domain.com", "SNI for http server")
 	grpcServerName = flag.String("grpcServerName", "attestor.domain.com", "SNI for grpc server")
@@ -61,6 +70,18 @@ var (
 )
 
 const ()
+
+var TPMDEVICES = []string{"/dev/tpm0", "/dev/tpmrm0"}
+
+func openTPM(path string) (io.ReadWriteCloser, error) {
+	if slices.Contains(TPMDEVICES, path) {
+		return tpmutil.OpenTPM(path)
+	} else if path == "simulator" {
+		return simulator.GetWithFixedSeedInsecure(1073741825)
+	} else {
+		return net.Dial("tcp", path)
+	}
+}
 
 type server struct {
 	mu      sync.Mutex
@@ -184,6 +205,7 @@ func (s *server) Attest(ctx context.Context, in *verifier.AttestRequest) (*verif
 	}
 
 	secret, err := ak.ActivateCredential(tpm, encryptedCredentials)
+	//secret, err := ak.ActivateCredentialWithEK(tpm, encryptedCredentials, *ek)
 	if err != nil {
 		glog.Errorf("ERROR:  error activating Credential  AK %v", err)
 		return &verifier.AttestResponse{}, status.Errorf(codes.Internal, "ERROR:  error activating Credentials")
@@ -326,7 +348,7 @@ func main() {
 	akConfig := &attest.AKConfig{
 		Parent: &attest.ParentKeyConfig{
 			Algorithm: attest.RSA,
-			Handle:    0x81000001, // srk https://trustedcomputinggroup.org/wp-content/uploads/TCG-TPM-v2.0-Provisioning-Guidance-Published-v1r1.pdf
+			Handle:    0x81000001, // SRK, pg 29 https://trustedcomputinggroup.org/wp-content/uploads/TCG-TPM-v2.0-Provisioning-Guidance-Published-v1r1.pdf
 		},
 	}
 	//akConfig := &attest.AKConfig{}
@@ -383,6 +405,107 @@ func main() {
 	)
 
 	glog.V(2).Infof("Generated ECC Public %s", string(pubkeyPem))
+
+	// if the *encodingPCR is set to non zero, then reset
+	//   that PCR bank  and extend it with the hash of the TLS Public key
+	//   the client can compare the PCR bank's value after quote/verify to
+	//   with the hash of the tls cert
+	if *encodingPCR != 0 {
+
+		hasher := sha256.New()
+		_, err := hasher.Write(pubkeybytes)
+		if err != nil {
+			glog.Errorf("ERROR:  hashing public cert %v", err)
+			os.Exit(1)
+		}
+		tlsCertificateHash := hasher.Sum(nil)
+		glog.V(2).Infof("Generated ECC Public Hash %s", base64.StdEncoding.EncodeToString((tlsCertificateHash)))
+
+		rwc, err := openTPM(*tpmDevice)
+		if err != nil {
+			glog.Errorf("ERROR:  open TPM %v", err)
+			os.Exit(1)
+		}
+		defer func() {
+			rwc.Close()
+		}()
+
+		rwr := transport.FromReadWriter(rwc)
+
+		pcrReadRsp, err := tpm2.PCRRead{
+			PCRSelectionIn: tpm2.TPMLPCRSelection{
+				PCRSelections: []tpm2.TPMSPCRSelection{
+					{
+						Hash:      tpm2.TPMAlgSHA256,
+						PCRSelect: tpm2.PCClientCompatible.PCRs(*encodingPCR),
+					},
+				},
+			},
+		}.Execute(rwr)
+		if err != nil {
+			glog.Errorf("ERROR:  could not get AK %v", err)
+			os.Exit(1)
+		}
+
+		for _, d := range pcrReadRsp.PCRValues.Digests {
+			glog.V(10).Infof("        Current Digest:   %s\n", hex.EncodeToString(d.Buffer))
+		}
+		glog.V(10).Infof("        Resetting Digest")
+		_, err = tpm2.PCRReset{
+			PCRHandle: tpm2.AuthHandle{
+				Handle: tpm2.TPMHandle(*encodingPCR),
+				Auth:   tpm2.PasswordAuth(nil),
+			},
+		}.Execute(rwr)
+		if err != nil {
+			glog.Errorf("ERROR:  could not reset PCR %v", err)
+			os.Exit(1)
+		}
+
+		_, err = tpm2.PCRExtend{
+			PCRHandle: tpm2.AuthHandle{
+				Handle: tpm2.TPMHandle(uint32(*encodingPCR)),
+				Auth:   tpm2.PasswordAuth(nil),
+			},
+			Digests: tpm2.TPMLDigestValues{
+				Digests: []tpm2.TPMTHA{
+					{
+						HashAlg: tpm2.TPMAlgSHA256,
+						Digest:  tlsCertificateHash,
+					},
+				},
+			},
+		}.Execute(rwr)
+		if err != nil {
+			glog.Errorf("ERROR:  could extend %v", err)
+			os.Exit(1)
+		}
+
+		pcrReadRspExtended, err := tpm2.PCRRead{
+			PCRSelectionIn: tpm2.TPMLPCRSelection{
+				PCRSelections: []tpm2.TPMSPCRSelection{
+					{
+						Hash:      tpm2.TPMAlgSHA256,
+						PCRSelect: tpm2.PCClientCompatible.PCRs(*encodingPCR),
+					},
+				},
+			},
+		}.Execute(rwr)
+		if err != nil {
+			glog.Errorf("ERROR:  could not read PCR %v", err)
+			os.Exit(1)
+		}
+
+		for _, d := range pcrReadRspExtended.PCRValues.Digests {
+			glog.V(10).Infof("        Extended Digest:   %s\n", hex.EncodeToString(d.Buffer))
+		}
+
+		err = rwc.Close()
+		if err != nil {
+			glog.Errorf("ERROR:  error closing tpm %v", err)
+			os.Exit(1)
+		}
+	}
 
 	// **********************************************************
 

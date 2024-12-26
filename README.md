@@ -31,6 +31,13 @@ so whats so good about this?  well, your client is _assured_ that they are termi
 
 Note the part where CA certificate (local or otherwise) which issues the x509 (step 4) isn't the critical part in this flow:  the fact that the attested _EC Public Key matches whats in the certificate and TLS session is important_.  If you wanted, instead of the attestor's CA that issues the x509, the client could've done that given the attested public key and its own CA and then returned the x509 to the server which would then be used it to start the TLS-HTTP server.  (see example [here](https://gist.github.com/salrashid123/10320c153ad6acdc31854c9775c43c0d) on how to apply a attested public key to a cert)
 
+
+for reference, see
+
+* [OpenEnclave AttestedTLS](https://github.com/openenclave/openenclave/blob/master/samples/attested_tls/AttestedTLSREADME.md)
+* [Using Attestation in Transport Layer Security (TLS) and Datagram Transport Layer Security (DTLS)](https://datatracker.ietf.org/doc/draft-fossati-tls-attestation/)
+* [BlindLlama TLS](https://blindllama.mithrilsecurity.io/en/latest/docs/concepts/TPMs/) 
+
 ---
 
 >> NOTE: this repo and code is *not* supported by google
@@ -64,9 +71,7 @@ export ATTESTOR_ADDRESS=34.30.250.78
 # tpm2_pcrread sha256:0
 #  sha256:
 #    0 : 0xA0B5FF3383A1116BD7DC6DF177C0C2D433B9EE1813EA958FA5D166A202CB2A85
-# alternatively, you can use go-tpm's pcrread: https://github.com/salrashid123/tpm2/tree/master/pcr_utils
 ```
-
 
 Now, since we're on GCP, get the EK Signing and intermediate certificates.  For other manufacturers, you can usually lookup the manufacturers CA out of band, eg for `CN=STM TPM EK Intermediate CA 06,O=STMicroelectronics NV,C=CH` they're listed [here](https://www.st.com/resource/en/technical_note/tn1330-st-trusted-platform-module-tpm-endorsement-key-ek-certificates-stmicroelectronics.pdf)
 
@@ -443,3 +448,20 @@ export ATTESTOR_ADDRESS=127.0.0.1
 go run client/grpc_verifier.go --host=127.0.0.1:50051 \
    --appaddress=$ATTESTOR_ADDRESS:8081      --ekintermediateCA=certs/stmmicro_intermediate.pem  --ekrootCA=certs/stmmicro_root.pem  --expectedPCRMapSHA256=0:3c5b53c48b7a21e554fbb14678c67dafd792151cd3bdc6017e35f1b4a41ff411     --v=10 -alsologtostderr
 ```
+
+#### Encoding ECC Certificate hash to PCR
+
+The attestor can optionally reset and then extend a given PCR's value using the hash of the issued TLS certificate.
+
+This capability is enabled if both the attestor and client supplies the `--encodingPCR=` parameter on startup.
+
+What this will do is for `--encodingPCR=23` is
+
+1. reset PCR=23 to zero value `0x0000000000000000000000000000000000000000000000000000000000000000`
+2. calculate the ECC TLS _certificate_ hash (not the public key)
+3. extend PCR23 with the hash of the certificate
+
+When the client invokes quote-verify, it can optionally recalculate the TLS certificates hash, then calculate the expected PCR hash knowing 
+that the server reset the pcr value, basically the hash of `sha256(append(0000000000000000000000000000000000000000000000000000000000000000, x509_cert_hash))`
+
+This is similar to [BlindLlama TLS](https://blindllama.mithrilsecurity.io/en/latest/docs/concepts/TPMs/) but doesn't really add that much value since the AK complete certified the TLS ECC key already.
