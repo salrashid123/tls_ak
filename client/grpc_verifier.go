@@ -37,6 +37,7 @@ import (
 	"github.com/salrashid123/tls_ak/verifier"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 )
 
 const ()
@@ -92,9 +93,32 @@ func main() {
 	ekReq := &verifier.GetEKRequest{}
 
 	c := verifier.NewVerifierClient(conn)
-	ekResponse, err := c.GetEK(ctx, ekReq)
+
+	pr := new(peer.Peer)
+	ekResponse, err := c.GetEK(ctx, ekReq, grpc.Peer(pr))
 	if err != nil {
 		glog.Errorf("GetEK Failed,   Original Error is: %v", err)
+		os.Exit(1)
+	}
+
+	switch info := pr.AuthInfo.(type) {
+	case credentials.TLSInfo:
+		authType := info.AuthType()
+		sn := info.State.ServerName
+		glog.V(20).Infof("        AuthType, ServerName %s, %s\n", authType, sn)
+		tlsInfo, ok := pr.AuthInfo.(credentials.TLSInfo)
+		if !ok {
+			glog.Errorf("ERROR:  Could get remote TLS")
+			os.Exit(1)
+		}
+		ekm, err := tlsInfo.State.ExportKeyingMaterial("my_nonce", nil, 32)
+		if err != nil {
+			glog.Errorf("ERROR:  Could getting EKM %v", err)
+			os.Exit(1)
+		}
+		glog.V(20).Infof("        EKM my_nonce: %s\n", hex.EncodeToString(ekm))
+	default:
+		glog.Errorf("Unknown AuthInfo type")
 		os.Exit(1)
 	}
 
@@ -394,7 +418,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	glog.V(5).Infof("     secureBoot State enabled %t", sb.Enabled)
+	glog.V(5).Infof("     secureBoot State enabled: [%t]", sb.Enabled)
 
 	if _, err := el.Verify(serverPlatformAttestationParameter.PCRs); err != nil {
 		glog.Errorf("Quote Verify Failed: %v", err)
@@ -443,6 +467,24 @@ func main() {
 	decodedTPMNTPublic, err := tpm2.DecodePublic(keyCertificationParameter.Public)
 	if err != nil {
 		glog.Errorf("error parsing TPM public key structure: %v", err)
+		os.Exit(1)
+	}
+
+	glog.V(20).Infof("     TLS Key AuthPolicy [%s]", hex.EncodeToString(decodedTPMNTPublic.AuthPolicy))
+
+	tlsKeyProps := decodedTPMNTPublic.Attributes
+	glog.V(20).Infof("     TLS Key TPM Properties mask: %d", tlsKeyProps)
+
+	expectedAttributeMask := tpm2.FlagSign | tpm2.FlagRestricted | tpm2.FlagFixedTPM | tpm2.FlagFixedParent | tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth ^ tpm2.FlagRestricted
+	glog.V(20).Infof("     TLS Key Expected Properties mask %d", expectedAttributeMask)
+
+	// https://github.com/google/go-attestation/blob/master/attest/tpm.go#L147
+	//   tpm2.FlagSignerDefault ^ tpm2.FlagRestricted
+	// where
+	// https://pkg.go.dev/github.com/google/go-tpm/legacy/tpm2#KeyProp
+	// FlagSignerDefault = FlagSign | FlagRestricted | FlagFixedTPM | FlagFixedParent | FlagSensitiveDataOrigin | FlagUserWithAuth
+	if expectedAttributeMask != tlsKeyProps {
+		glog.Errorf("error TLS Key attribute mismatch, expected [%d], got [%d]", expectedAttributeMask, tlsKeyProps)
 		os.Exit(1)
 	}
 

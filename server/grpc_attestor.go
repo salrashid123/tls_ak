@@ -96,18 +96,40 @@ func authUnaryInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
+	var newCtx context.Context
+	var peerIPPort string
 	p, ok := peer.FromContext(ctx)
 	if ok {
-		peerIPPort, _, err := net.SplitHostPort(p.Addr.String())
+		var err error
+		peerIPPort, _, err = net.SplitHostPort(p.Addr.String())
 		if err != nil {
-			return nil, status.Errorf(codes.PermissionDenied, fmt.Sprintf("Could not get Remote IP   %v", err))
+			return nil, status.Errorf(codes.PermissionDenied, "could not get Remote IP")
 		}
-		glog.V(20).Infof("     Connected from peer %v", peerIPPort)
+		glog.V(40).Infof("     Connected from peer %v", peerIPPort)
+		newCtx = context.WithValue(ctx, contextKey("peerIP"), peerIPPort)
 	} else {
 		glog.Errorf("ERROR:  Could not extract peerInfo from TLS")
 		return nil, status.Errorf(codes.PermissionDenied, "ERROR:  Could not extract peerInfo from TLS")
 	}
-	return handler(ctx, req)
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok {
+		glog.Errorf("ERROR:  Could get remote TLS")
+		return nil, status.Errorf(codes.PermissionDenied, "ERROR: could not get remote TLS")
+	}
+	ekm, err := tlsInfo.State.ExportKeyingMaterial("my_nonce", nil, 32)
+	if err != nil {
+		glog.Errorf("ERROR:  Could getting EKM %v", err)
+		return nil, status.Errorf(codes.PermissionDenied, "ERROR: error getting EKM")
+	}
+	glog.V(40).Infof("     EKM my_nonce: %s\n", hex.EncodeToString(ekm))
+
+	event := &event{
+		EKM:    hex.EncodeToString(ekm),
+		PeerIP: peerIPPort,
+	}
+
+	newCtx = context.WithValue(newCtx, contextEventKey, *event)
+	return handler(newCtx, req)
 }
 
 const contextEventKey contextKey = "event"
@@ -190,6 +212,10 @@ func (s *server) Attest(ctx context.Context, in *verifier.AttestRequest) (*verif
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	glog.V(2).Infof("======= Attest ========")
+
+	val := ctx.Value(contextKey("event")).(event)
+	glog.V(30).Infof("     Inbound gRPC request from: %s", val.PeerIP)
+	glog.V(30).Infof("     Inbound EKM: %s", val.EKM)
 
 	ak, err := tpm.LoadAK(akbytes)
 	if err != nil {
@@ -365,6 +391,10 @@ func main() {
 	}
 
 	// now crate the TLS EC key on the TPM
+	// https://github.com/google/go-attestation/blob/master/attest/tpm.go#L147
+	//   tpm2.FlagSignerDefault ^ tpm2.FlagRestricted
+	// where
+	// FlagSignerDefault = FlagSign | FlagRestricted | FlagFixedTPM | FlagFixedParent | FlagSensitiveDataOrigin | FlagUserWithAuth
 	kConfig := &attest.KeyConfig{
 		Algorithm: attest.ECDSA,
 		Size:      256,
