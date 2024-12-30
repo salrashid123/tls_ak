@@ -580,3 +580,27 @@ When the client invokes quote-verify, it can optionally recalculate the TLS cert
 that the server reset the pcr value, basically the hash of `sha256(append(0000000000000000000000000000000000000000000000000000000000000000, x509_cert_hash))`
 
 This is similar to [BlindLlama TLS](https://blindllama.mithrilsecurity.io/en/latest/docs/concepts/TPMs/) but doesn't really add that much value since the AK completely certified the TLS ECC key already.
+
+
+#### TLS-PSK
+
+Another variation of this is to use [TLS-PSK](https://www.rfc-editor.org/rfc/rfc4279) between single client->server.
+
+This mode is designed for a single client to connect to a single server where the TLS session is created using a pre-shared key which is itself securely transferred from the client to the server after remote attestation.  That PSK is used to launch a new TLS session which does not involve certificates.
+
+Unfortunately, go does not yet support PSK: [issue 6379](https://github.com/golang/go/issues/6379#issuecomment-2079691128)
+
+![images/pks.png](images/psk.png)
+
+Anyway, once its ready, you can securely transfer a PSK directly using 
+
+* on client [server.CreateImportBlob()](https://pkg.go.dev/github.com/google/go-tpm-tools@v0.4.4/server#CreateImportBlob)
+* on server [client.Key.Import()](https://pkg.go.dev/github.com/google/go-tpm-tools/client#Key.Import)
+
+(yes, i know, the package names in the go library is inverted)
+
+for further examples, see:
+
+- [Go-TPM-Wrapping - Go library for encrypting data using Trusted Platform Module (TPM)](https://github.com/salrashid123/go-tpm-wrapping)
+- [TPM Remote Attestation protocol using go-tpm and gRPC](https://github.com/salrashid123/go_tpm_remote_attestation?tab=readme-ov-file#aes)
+- [Multiparty Consent Based Networks (MCBN)](https://github.com/salrashid123/mcbn)
