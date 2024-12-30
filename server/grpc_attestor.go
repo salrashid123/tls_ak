@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"slices"
 	"time"
 
@@ -90,6 +92,14 @@ type server struct {
 
 type contextKey string
 
+const contextEventKey contextKey = "event"
+
+type event struct {
+	PeerCertificates []*x509.Certificate
+	EKM              string
+	PeerIP           string
+}
+
 func authUnaryInterceptor(
 	ctx context.Context,
 	req interface{},
@@ -105,7 +115,7 @@ func authUnaryInterceptor(
 		if err != nil {
 			return nil, status.Errorf(codes.PermissionDenied, "could not get Remote IP")
 		}
-		glog.V(40).Infof("     Connected from peer %v", peerIPPort)
+		glog.V(60).Infof("     Connected from peer %v", peerIPPort)
 		newCtx = context.WithValue(ctx, contextKey("peerIP"), peerIPPort)
 	} else {
 		glog.Errorf("ERROR:  Could not extract peerInfo from TLS")
@@ -121,7 +131,7 @@ func authUnaryInterceptor(
 		glog.Errorf("ERROR:  Could getting EKM %v", err)
 		return nil, status.Errorf(codes.PermissionDenied, "ERROR: error getting EKM")
 	}
-	glog.V(40).Infof("     EKM my_nonce: %s\n", hex.EncodeToString(ekm))
+	glog.V(60).Infof("     EKM my_nonce: %s\n", hex.EncodeToString(ekm))
 
 	event := &event{
 		EKM:    hex.EncodeToString(ekm),
@@ -130,14 +140,6 @@ func authUnaryInterceptor(
 
 	newCtx = context.WithValue(newCtx, contextEventKey, *event)
 	return handler(newCtx, req)
-}
-
-const contextEventKey contextKey = "event"
-
-type event struct {
-	PeerCertificates []*x509.Certificate
-	EKM              string
-	PeerIP           string
 }
 
 func eventsMiddleware(h http.Handler) http.Handler {
@@ -214,8 +216,8 @@ func (s *server) Attest(ctx context.Context, in *verifier.AttestRequest) (*verif
 	glog.V(2).Infof("======= Attest ========")
 
 	val := ctx.Value(contextKey("event")).(event)
-	glog.V(30).Infof("     Inbound gRPC request from: %s", val.PeerIP)
-	glog.V(30).Infof("     Inbound EKM: %s", val.EKM)
+	glog.V(60).Infof("     Inbound gRPC request from: %s", val.PeerIP)
+	glog.V(60).Infof("     Inbound EKM: %s", val.EKM)
 
 	ak, err := tpm.LoadAK(akbytes)
 	if err != nil {
@@ -398,6 +400,10 @@ func main() {
 	kConfig := &attest.KeyConfig{
 		Algorithm: attest.ECDSA,
 		Size:      256,
+		// Parent: &attest.ParentKeyConfig{
+		// 	Algorithm: attest.RSA,
+		// 	Handle:    0x81000001, // default RSA SRK
+		// },
 	}
 	nk, err := tpm.NewKey(ak, kConfig)
 	if err != nil {
@@ -434,7 +440,7 @@ func main() {
 		},
 	)
 
-	glog.V(2).Infof("Generated ECC Public %s", string(pubkeyPem))
+	glog.V(2).Infof("Generated ECC Public \n%s", string(pubkeyPem))
 
 	// **********************************************************
 
@@ -478,13 +484,20 @@ func main() {
 		os.Exit(1)
 	}
 	rblock, _ := pem.Decode(issuerKeyBytes)
-	r, err := x509.ParsePKCS8PrivateKey(rblock.Bytes)
+	issuerPrivateKey, err := x509.ParsePKCS8PrivateKey(rblock.Bytes)
 	if err != nil {
 		glog.Errorf("ERROR:  error loading privatekey %v", err)
 		os.Exit(1)
 	}
 
+	issuerRootCAs := x509.NewCertPool()
+	if !issuerRootCAs.AppendCertsFromPEM(issuerCertBytes) {
+		glog.Errorf("no root Issuer certs parsed from file ")
+		os.Exit(1)
+	}
+
 	// simulate creating a CSR to send to some CA
+	//  the spiffie and CN i'm just making up and is totally optional..its the serial number for the EK
 	var csrtemplate = x509.CertificateRequest{
 		Subject: pkix.Name{
 			Organization:       []string{"Acme Co"},
@@ -492,9 +505,14 @@ func main() {
 			Locality:           []string{"Mountain View"},
 			Province:           []string{"California"},
 			Country:            []string{"US"},
-			CommonName:         "foo",
+			CommonName:         ek.Certificate.SerialNumber.String(),
 		},
-		DNSNames:           []string{*httpServerName},
+		DNSNames: []string{*httpServerName},
+		URIs: []*url.URL{{
+			Scheme: "spiffie",
+			Host:   *httpServerName,
+			Path:   fmt.Sprintf("tcg-at-platformSerial/%s", ek.Certificate.SerialNumber.String()),
+		}},
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}
 
@@ -526,6 +544,15 @@ func main() {
 	}
 
 	// now use certain fields within the CSR and the overall template to issue the cert on the CA
+
+	// I'm injecting the policy here...this too is just optional and while its not even used, i don't know if this is entirely applicable/correct
+	// pg4  https://trustedcomputinggroup.org/wp-content/uploads/TCG-OID-Registry-Version-1.00-Revision-0.74_10July24.pdf
+	// 2.23.133.11.1.1 tcg-cap-verifiedTPMResidency
+	// 2.23.133.11.1.2 tcg-cap-verifiedTPMFixed
+
+	verifiedTPMResidency := asn1.ObjectIdentifier{2, 23, 133, 11, 1, 1}
+	verifiedTPMFixed := asn1.ObjectIdentifier{2, 23, 133, 11, 1, 2}
+
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
@@ -537,16 +564,18 @@ func main() {
 			CommonName:         clientCSR.Subject.CommonName, // from CSR
 		},
 		DNSNames:              clientCSR.DNSNames, // from CSR
+		URIs:                  clientCSR.URIs,
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		PolicyIdentifiers:     []asn1.ObjectIdentifier{verifiedTPMResidency, verifiedTPMFixed},
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 	}
 
 	// now issue the cert using the local CA
-	issuedTLSderBytes, err = x509.CreateCertificate(rand.Reader, &template, rcert, clientCSR.PublicKey, r)
+	issuedTLSderBytes, err = x509.CreateCertificate(rand.Reader, &template, rcert, clientCSR.PublicKey, issuerPrivateKey)
 	if err != nil {
 		glog.Errorf("ERROR:  Failed to create certificate: %s\n", err)
 		os.Exit(1)
@@ -681,7 +710,7 @@ func main() {
 	// again, note the privatekey is the signer
 	ctx := context.Background()
 	tlsCrt := tls.Certificate{
-		Certificate: [][]byte{p.Raw},
+		Certificate: [][]byte{p.Raw, rcert.Raw},
 		Leaf:        p,
 		PrivateKey:  signer,
 	}

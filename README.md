@@ -94,7 +94,7 @@ SSH to the attestor, [install golang](https://go.dev/doc/install) and run
 ```bash
 $ git clone https://github.com/salrashid123/tls_ak.git
 
-$ go run server/grpc_attestor.go --grpcport :50051 --v=10 -alsologtostderr
+$ go run server/grpc_attestor.go --grpcport :50051 --applicationPort :8081 --v=10 -alsologtostderr
 
 
     I0511 13:43:28.834045    5882 grpc_attestor.go:273] Getting EKCert
@@ -140,25 +140,24 @@ $ go run server/grpc_attestor.go --grpcport :50051 --v=10 -alsologtostderr
 
     I0511 13:43:29.147592    5882 grpc_attestor.go:539] Starting HTTP Server on port :8081
     I0511 13:43:29.147997    5882 grpc_attestor.go:581] Starting gRPC server on port :50051
-
-
-
-
-    I0511 13:44:25.690575    5882 grpc_attestor.go:112] ======= GetEK ========
-    I0511 13:44:25.720134    5882 grpc_attestor.go:129] ======= GetAK ========
-    I0511 13:44:25.806829    5882 grpc_attestor.go:152] ======= Attest ========
-    I0511 13:44:26.090723    5882 grpc_attestor.go:181] ======= Quote ========
-    I0511 13:44:26.561391    5882 grpc_attestor.go:218] ======= GetTLSKey ========
-
-    I0511 13:44:26.728640    5882 grpc_attestor.go:257] Inbound HTTP request..
-
-
 ```
+
+install [tpm2-tools](https://tpm2-tools.readthedocs.io/en/latest/INSTALL/) (`apt-get install tpm2-tools`) and print out the PCR=0 value. 
+
+For me on GCE VM, it was
+
+```bash
+$ tpm2_pcrread sha256:0
+  sha256:
+    0 : 0xA0B5FF3383A1116BD7DC6DF177C0C2D433B9EE1813EA958FA5D166A202CB2A85
+```
+
+This PCR value is what the verifier checks via quote/verify later
 
 
 #### Verifier
 
-On the laptop, run the verifier
+On the laptop, run the verifier (remember to specify the expected lowercase PCR value)
 
 ```bash
 $ git clone https://github.com/salrashid123/tls_ak.git
@@ -388,10 +387,10 @@ curl -s $(openssl x509 -in certs/ek_intermediate.pem -noout -text | grep -Po "((
 
 ## or by hand, (the URLs are encoded into the ekcert so your values will be different)
 
-$ wget http://privateca-content-633beb94-0000-25c1-a9d7-001a114ba6e8.storage.googleapis.com/c59a22589ab43a57e3a4/ca.crt -O ek_intermediate.crt
-$ wget http://privateca-content-62d71773-0000-21da-852e-f4f5e80d7778.storage.googleapis.com/032bf9d39db4fa06aade/ca.crt -O ek_root.crt 
-$ openssl x509 -inform der -in ek_intermediate.crt -out ek_intermediate.pem
-$ openssl x509 -inform der -in ek_root.crt -out ek_root.pem
+$ wget http://privateca-content-633beb94-0000-25c1-a9d7-001a114ba6e8.storage.googleapis.com/c59a22589ab43a57e3a4/ca.crt -O ek_intermediate.der
+$ wget http://privateca-content-62d71773-0000-21da-852e-f4f5e80d7778.storage.googleapis.com/032bf9d39db4fa06aade/ca.crt -O ek_root.der 
+$ openssl x509 -inform der -in ek_intermediate.der -out ek_intermediate.pem
+$ openssl x509 -inform der -in ek_root.der -out ek_root.pem
 
 $ openssl x509 -in ekcert.pem -text -noout
 Certificate:
@@ -433,25 +432,141 @@ For me, the TPM was issued by `CN=STM TPM EK Intermediate CA 06,O=STMicroelectro
 
 for which the verification  certs were found [here](https://www.st.com/resource/en/technical_note/tn1330-st-trusted-platform-module-tpm-endorsement-key-ek-certificates-stmicroelectronics.pdf)
 
+```bash
+## ekpublic
+$ tpm2_createek -c ek.ctx -G rsa -u ek.pub 
+$ tpm2_readpublic -c ek.ctx -o ek.pem -f PEM -Q
+
+## ekcert
+$ tpm2_getekcertificate -X -o ECcert.bin
+$ openssl x509 -in ECcert.bin -inform DER -noout -text
+
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: C=CH, O=STMicroelectronics NV, CN=STM TPM EK Intermediate CA 06
+        X509v3 extensions:
+            X509v3 Authority Key Identifier: 
+                FB:17:D7:0D:73:48:70:E9:19:C4:E8:E6:03:97:5E:66:4E:0E:43:DE
+            X509v3 Subject Alternative Name: critical
+                DirName:/2.23.133.2.1=id:53544D20/2.23.133.2.2=ST33HTPHAHD8/2.23.133.2.3=id:00010102
+            X509v3 Subject Directory Attributes: 
+                0.0...g....1.0...2.0.......
+            X509v3 Basic Constraints: critical
+                CA:FALSE
+            X509v3 Extended Key Usage: 
+                2.23.133.8.1
+            X509v3 Key Usage: critical
+                Key Encipherment
+            Authority Information Access: 
+                CA Issuers - URI:http://secure.globalsign.com/stmtpmekint06.crt
+```
+
+for my local tpm, the value for the EKCert had a signer of
+
+```bash
+$ wget http://secure.globalsign.com/stmtpmekint06.crt
+
+$ openssl x509 -in stmtpmekint06.crt -inform DER -noout -text
+
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number: 1073741831 (0x40000007)
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: C=CH, O=STMicroelectronics NV, CN=STM TPM EK Root CA
+        Validity
+            Not Before: Oct 31 00:00:00 2018 GMT
+            Not After : Jan  1 00:00:00 2038 GMT
+        Subject: C=CH, O=STMicroelectronics NV, CN=STM TPM EK Intermediate CA 06
+        X509v3 extensions:
+            X509v3 Subject Key Identifier: 
+                FB:17:D7:0D:73:48:70:E9:19:C4:E8:E6:03:97:5E:66:4E:0E:43:DE
+            X509v3 Authority Key Identifier: 
+                6F:E6:C5:6C:07:B7:6C:8B:0A:81:92:83:5C:CB:41:1E:F6:8E:D1:27
+            X509v3 Certificate Policies: critical
+                Policy: X509v3 Any Policy
+                  CPS: http://www.st.com/TPM/repository/
+            X509v3 Key Usage: critical
+                Certificate Sign
+            X509v3 Basic Constraints: critical
+                CA:TRUE, pathlen:    
+
+```
+
+Which you can also get from the doc above, page 5 `ST Intermediate CA 06 https://secure.globalsign.com/cacert/stmtpmekint06.crt`
+
+To get the root, again on pg5 of the doc `ST TPM Root certificate https://secure.globalsign.com/cacert/stmtpmekroot.crt`
+
+```bash
+$ sudo openssl x509 -in stmtpmekroot.crt -inform DER -noout -text
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            04:00:00:00:00:01:22:c1:6c:f3:7e
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: OU=GlobalSign Trusted Computing Certificate Authority, O=GlobalSign, CN=GlobalSign Trusted Platform Module Root CA
+        Subject: C=CH, O=STMicroelectronics NV, CN=STM TPM EK Root CA
+        X509v3 extensions:
+            X509v3 Key Usage: critical
+                Certificate Sign
+            X509v3 Basic Constraints: critical
+                CA:TRUE, pathlen:1
+            X509v3 Subject Key Identifier: 
+                6F:E6:C5:6C:07:B7:6C:8B:0A:81:92:83:5C:CB:41:1E:F6:8E:D1:27
+            X509v3 Certificate Policies: 
+                Policy: 1.3.6.1.4.1.4146.1.90
+                  CPS: http://www.globalsign.net/repository/
+            X509v3 Authority Key Identifier: 
+                1E:23:63:F0:85:B5:F6:25:4E:ED:1A:C0:50:BE:65:7C:C7:D4:15:7A
+```
+
+again back to the root `GlobalSign Trusted Computing CA https://secure.globalsign.com/cacert/gstpmroot.crt`
+
+```bash
+$ wget https://secure.globalsign.com/cacert/gstpmroot.crt
+$ openssl x509 -in gstpmroot.crt -inform DER -noout -text
+
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            04:00:00:00:00:01:20:19:09:19:ae
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: OU=GlobalSign Trusted Computing Certificate Authority, O=GlobalSign, CN=GlobalSign Trusted Platform Module Root CA
+        Subject: OU=GlobalSign Trusted Computing Certificate Authority, O=GlobalSign, CN=GlobalSign Trusted Platform Module Root CA
+        X509v3 extensions:
+            X509v3 Key Usage: critical
+                Certificate Sign, CRL Sign
+            X509v3 Basic Constraints: critical
+                CA:TRUE
+            X509v3 Subject Key Identifier: 
+                1E:23:63:F0:85:B5:F6:25:4E:ED:1A:C0:50:BE:65:7C:C7:D4:15:7A
+```
+
 The PCR values `PCR0` were:
 
 ```bash
 $ tpm2_pcrread
   sha256:
-    0 : 0x3C5B53C48B7A21E554FBB14678C67DAFD792151CD3BDC6017E35F1B4A41FF411
+    0 : 0x3C5B53C48B7A21E554FBB14678C67DAFD792151CD3BDC6017E35F1B4A41FF412
 ```
 
 So to run, i used
 
 ```bash
+go run server/grpc_attestor.go --grpcport :50051 --applicationPort :8081  --v=10 -alsologtostderr
+
 export ATTESTOR_ADDRESS=127.0.0.1
 go run client/grpc_verifier.go --host=127.0.0.1:50051 \
-   --appaddress=$ATTESTOR_ADDRESS:8081      --ekintermediateCA=certs/stmmicro_intermediate.pem  --ekrootCA=certs/stmmicro_root.pem  --expectedPCRMapSHA256=0:3c5b53c48b7a21e554fbb14678c67dafd792151cd3bdc6017e35f1b4a41ff411     --v=10 -alsologtostderr
+   --appaddress=$ATTESTOR_ADDRESS:8081      --ekintermediateCA=certs/stmtpmek_combined.pem  --ekrootCA=certs/gstpmroot.pem  --expectedPCRMapSHA256=0:3c5b53c48b7a21e554fbb14678c67dafd792151cd3bdc6017e35f1b4a41ff412     --v=10 -alsologtostderr
 ```
 
 #### Encoding ECC Certificate hash to PCR
 
-The attestor can optionally reset and then extend a given PCR's value using the hash of the issued TLS certificate.
+The attestor can optionally **reset** and then extend a given PCR's value using the hash of the issued TLS certificate.
 
 This capability is enabled if both the attestor and client supplies the `--encodingPCR=` parameter on startup.
 
@@ -464,4 +579,4 @@ What this will do is for `--encodingPCR=23` is
 When the client invokes quote-verify, it can optionally recalculate the TLS certificates hash, then calculate the expected PCR hash knowing 
 that the server reset the pcr value, basically the hash of `sha256(append(0000000000000000000000000000000000000000000000000000000000000000, x509_cert_hash))`
 
-This is similar to [BlindLlama TLS](https://blindllama.mithrilsecurity.io/en/latest/docs/concepts/TPMs/) but doesn't really add that much value since the AK complete certified the TLS ECC key already.
+This is similar to [BlindLlama TLS](https://blindllama.mithrilsecurity.io/en/latest/docs/concepts/TPMs/) but doesn't really add that much value since the AK completely certified the TLS ECC key already.
