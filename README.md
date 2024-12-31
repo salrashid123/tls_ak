@@ -296,6 +296,8 @@ What you'll see in the output is the full remote attestation, then a certificate
 
 The client connects to the server and prints the public key....the fact the same public keys are shown confirms the attested key on the TPM is at the other end of the TLS session.
 
+If you want to see the full sample log, see th `logs/` folder
+
 ---
 
 Once the https server is running, you can continue to interact with it on port `:8081`
@@ -564,24 +566,6 @@ export ATTESTOR_ADDRESS=127.0.0.1
 go run client/grpc_verifier.go --host=127.0.0.1:50051 \
    --appaddress=$ATTESTOR_ADDRESS:8081      --ekintermediateCA=certs/stmtpmek_combined.pem  --ekrootCA=certs/gstpmroot.pem  --expectedPCRMapSHA256=0:3c5b53c48b7a21e554fbb14678c67dafd792151cd3bdc6017e35f1b4a41ff412     --v=10 -alsologtostderr
 ```
-
-#### Encoding ECC Certificate hash to PCR
-
-The attestor can optionally **reset** and then extend a given PCR's value using the hash of the issued TLS certificate.
-
-This capability is enabled if both the attestor and client supplies the `--encodingPCR=` parameter on startup.
-
-What this will do is for `--encodingPCR=23` is
-
-1. reset PCR=23 to zero value `0x0000000000000000000000000000000000000000000000000000000000000000`
-2. calculate the ECC TLS _certificate_ hash (not the public key)
-3. extend PCR23 with the hash of the certificate
-
-When the client invokes quote-verify, it can optionally recalculate the TLS certificates hash, then calculate the expected PCR hash knowing 
-that the server reset the pcr value, basically the hash of `sha256(append(0000000000000000000000000000000000000000000000000000000000000000, x509_cert_hash))`
-
-This is similar to [BlindLlama TLS](https://blindllama.mithrilsecurity.io/en/latest/docs/concepts/TPMs/) but doesn't really add that much value since the AK completely certified the TLS ECC key already.
-
 
 #### TLS-PSK
 
