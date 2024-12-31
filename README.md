@@ -2,6 +2,22 @@
 
 `TLS` where the private key on the server is bound to its `Trusted Platform Module (TPM)`.  That same TLS key is also attested through full [TPM Remote Attestation](https://tpm2-software.github.io/tpm2-tss/getting-started/2019/12/18/Remote-Attestation.html).
 
+TPM based TLS is a known technology where the private key used for TLS is embedded inside a
+peer's `Trusted Platform Module (TPM)`. However, TLS usually requires an x509 certificate which is
+itself signed by a certificate authority the peer trusts. The remote client has to trust the certificate
+issuer and that the private key resides on a TPM.
+
+This repo describes steps whereby a remote party uses standard [TPM Remote Attestation](https://tpm2-software.github.io/tpm2-tss/getting-started/2019/12/18/Remote-Attestation.html) to ensure a keypair is resident on a TPM and then establishes TLS to the remote host by comparing
+the peer's Public Key values during session setup. The distinguishing characteristic of this flow is
+the TLS Certificate by itself or the CA that the peer uses is not necessarily trusted but serves as a
+conduit to create the TLS session and derive the fact that the session uses the trusted public key
+on the TPM. The client trusts the TLS session not based on the x509 certificate alone of the peer or
+CA but by comparing the Public Key used in the session matches what is on the TPM confirmed
+through remote attestation and certification of the key.
+
+Essentially, the trusted authority that issues the x509 certificate for TLS is not strictly untrusted but yet the
+client can ensure the TLS session terminates on a device that is confirmed to host the session's private key
+
 This ensures the client is connecting to the remote host where the TPM resides
 
 Basically,
