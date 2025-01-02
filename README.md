@@ -15,7 +15,7 @@ on the TPM. The client trusts the TLS session not based on the x509 certificate 
 CA but by comparing the Public Key used in the session matches what is on the TPM confirmed
 through remote attestation and certification of the key.
 
-Essentially, the trusted authority that issues the x509 certificate for TLS is not strictly untrusted but yet the
+Essentially, the trusted authority that issues the x509 certificate for TLS is not strictly trusted but yet the
 client can ensure the TLS session terminates on a device that is confirmed to host the session's private key
 
 This ensures the client is connecting to the remote host where the TPM resides
@@ -45,8 +45,7 @@ After that, a new `HTTPS` server is launched which uses the EC Key on the TPM an
 
 so whats so good about this?  well, your client is _assured_ that they are terminating the TLS connection on that VM that includes that specific TPM.
 
-Note the part where CA certificate (local or otherwise) which issues the x509 (step 4) isn't the critical part in this flow:  the fact that the attested _EC Public Key matches whats in the certificate and TLS session is important_.  If you wanted, instead of the attestor's CA that issues the x509, the client could've done that given the attested public key and its own CA and then returned the x509 to the server which would then be used it to start the TLS-HTTP server.  (see example [here](https://gist.github.com/salrashid123/10320c153ad6acdc31854c9775c43c0d) on how to apply a attested public key to a cert)
-
+Note the part where CA certificate (local or otherwise) which issues the x509 (step 4) isn't the critical part in this flow:  the fact that the attested _EC Public Key matches whats in the certificate and TLS session is important_.  If you wanted, instead of the attestor's CA that issues the x509, the server could have sent a CSR to the client (or privacy CA) for issuance.
 
 for reference, see
 
@@ -590,6 +589,8 @@ Another variation of this is to use [TLS-PSK](https://www.rfc-editor.org/rfc/rfc
 This mode is designed for a single client to connect to a single server where the TLS session is created using a pre-shared key which is itself securely transferred from the client to the server after remote attestation.  That PSK is used to launch a new TLS session which does not involve certificates.
 
 Unfortunately, go does not yet support PSK: [issue 6379](https://github.com/golang/go/issues/6379#issuecomment-2079691128)
+
+Just note that this variant does not *ensure* the TLS remote peer terminates on a TPM but just that the EK associated with the TPM did at some point decrypt the PSK.  In other words, the PSK can get decrypted by the EK but then turn around and share that PSK with another system that does setup TLS.
 
 ![images/pks.png](images/psk.png)
 

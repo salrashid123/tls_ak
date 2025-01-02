@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"hash"
@@ -27,13 +28,15 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/google/go-attestation/attest"
+	x509ext "github.com/google/go-attestation/x509"
+
 	"github.com/google/uuid"
 
 	"github.com/google/go-tpm-tools/proto/tpm"
 	"github.com/google/go-tpm-tools/server"
 
+	oid "github.com/google/go-attestation/oid"
 	"github.com/google/go-tpm/legacy/tpm2"
-	certparser "github.com/salrashid123/gcp-vtpm-ek-ak/parser"
 	"github.com/salrashid123/tls_ak/verifier"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -142,6 +145,92 @@ func main() {
 		os.Exit(1)
 	}
 
+	// optionally parse SAN.DirName, eg:
+	// pg 24,26: https://trustedcomputinggroup.org/wp-content/uploads/TCG_IWG_Credential_Profile_EK_V2.1_R13.pdf
+	// X509v3 Subject Alternative Name: critical
+	//   DirName:/2.23.133.2.1=id:53544D20/2.23.133.2.2=ST33HTPHAHD8/2.23.133.2.3=id:00010102
+	// 2.23.133.2.1 tcg-at-tpmManufacturer TPM Manufacturer Name for EK Credential Profile for TPM 2.0
+	//     id:53544D20 = hex("STM")
+	// 2.23.133.2.2 tcg-at-tpmModel TPM Model Number defined in EK Credential Profile for TPM 2.0
+	// 2.23.133.2.3 tcg-at-tpmVersion TPM Version defined in EK Credential Profile for TPM 2.0
+
+	var oidExtensionSubjectAltName = []int{2, 5, 29, 17}
+	var oidExtensionSubjectDirectoryAttributes = []int{2, 5, 29, 9}
+	type tpmSpecification struct {
+		Family   string
+		Level    int
+		Revision int
+	}
+	type attribute struct {
+		Type   asn1.ObjectIdentifier
+		Values []asn1.RawValue `asn1:"set"`
+	}
+	for _, ex := range ekcert.Extensions {
+		if ex.Id.Equal(oidExtensionSubjectAltName) {
+			s, err := x509ext.ParseSubjectAltName(ex)
+			if err != nil {
+				glog.Errorf("failed to unmarshal EK SAN " + err.Error())
+				os.Exit(1)
+			}
+			for _, na := range s.DirectoryNames {
+				for _, attr := range na.Names {
+					if attr.Type.Equal(oid.TPMManufacturer) {
+						glog.V(20).Infof("     TPM Manufacturer %s", attr.Value)
+					}
+					if attr.Type.Equal(oid.TPMModel) {
+						glog.V(20).Infof("     TPM Model %s", attr.Value)
+					}
+					if attr.Type.Equal(oid.TPMVersion) {
+						// todo: parse the major/minor version properly
+						glog.V(20).Infof("     TPM Version %s", attr.Value)
+					}
+				}
+
+			}
+		}
+
+		if ex.Id.Equal(oidExtensionSubjectDirectoryAttributes) {
+
+			var attrs []attribute
+			_, err := asn1.Unmarshal(ex.Value, &attrs)
+			if err != nil {
+				glog.Errorf("failed to parse EK SubjectDirectoryAttributes" + err.Error())
+				os.Exit(1)
+			}
+
+			for _, attr := range attrs {
+				if attr.Type.Equal(oid.TPMSpecification) {
+					if len(attr.Values) != 1 {
+						glog.Errorf("failed to parse EK SubjectDirectoryAttributes ", errors.New("expected SET size of 1"))
+						os.Exit(1)
+					}
+					value := attr.Values[0]
+					var spec tpmSpecification
+					rest, err := asn1.Unmarshal(value.FullBytes, &spec)
+					if err != nil {
+						glog.Errorf("failed to parse EK SubjectDirectoryAttributes ", err)
+						os.Exit(1)
+					}
+					if len(rest) != 0 {
+						glog.Errorf("failed to parse EK SubjectDirectoryAttributes ", err)
+						os.Exit(1)
+					}
+					glog.V(20).Infof("     TPM Family %s", spec.Family)
+					glog.V(20).Infof("     TPM Level %d", spec.Level)
+					glog.V(20).Infof("     TPM Revision %d", spec.Revision)
+				}
+			}
+		}
+	}
+
+	// if the service is on GCP, the ekcert has some special details encoded inside it
+	gceInfo, err := server.GetGCEInstanceInfo(ekcert)
+	if err == nil && gceInfo != nil {
+		glog.V(10).Infof("     EKCert  GCE InstanceID %d", gceInfo.InstanceId)
+		glog.V(10).Infof("     EKCert  GCE InstanceName %s", gceInfo.InstanceName)
+		glog.V(10).Infof("     EKCert  GCE ProjectId %s", gceInfo.ProjectId)
+	}
+
 	ekcrtPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ekResponse.EkCert})
 	glog.V(2).Infof("        EKCertificate ========\n%s\n", ekcrtPEM)
 
@@ -162,14 +251,6 @@ func main() {
 	glog.V(10).Infof("     EKCert  Issuer %v", ekcert.Issuer)
 	glog.V(10).Infof("     EKCert  IssuingCertificateURL %v", fmt.Sprint(ekcert.IssuingCertificateURL))
 
-	// if the service is on GCP, the ekcert has some special details encoded inside it
-	gceInfo, err := server.GetGCEInstanceInfo(ekcert)
-	if err == nil && gceInfo != nil {
-		glog.V(10).Infof("     EKCert  GCE InstanceID %d", gceInfo.InstanceId)
-		glog.V(10).Infof("     EKCert  GCE InstanceName %s", gceInfo.InstanceName)
-		glog.V(10).Infof("     EKCert  GCE ProjectId %s", gceInfo.ProjectId)
-	}
-
 	glog.V(40).Infof("    EkCert Public Key \n%s\n", ekPubPEM)
 
 	// now try to verify the EKCert is legit using the CA's you expect woud've signed it
@@ -189,7 +270,7 @@ func main() {
 
 	var exts []asn1.ObjectIdentifier
 	for _, ext := range ekcert.UnhandledCriticalExtensions {
-		if ext.Equal(certparser.OidExtensionSubjectAltName) {
+		if ext.Equal(oidExtensionSubjectAltName) {
 			continue
 		}
 		exts = append(exts, ext)
@@ -204,50 +285,6 @@ func main() {
 			glog.V(10).Infof("     EKCert Includes tcg-kp-EKCertificate ExtendedKeyUsage %s", ku.String())
 		}
 	}
-
-	// optionally parse SAN.DirName, eg:
-	// pg 24: https://trustedcomputinggroup.org/wp-content/uploads/TCG_IWG_Credential_Profile_EK_V2.1_R13.pdf
-	// X509v3 Subject Alternative Name: critical
-	//   DirName:/2.23.133.2.1=id:53544D20/2.23.133.2.2=ST33HTPHAHD8/2.23.133.2.3=id:00010102
-	// 2.23.133.2.1 tcg-at-tpmManufacturer TPM Manufacturer Name for EK Credential Profile for TPM 2.0
-	//     id:53544D20 https://github.com/cedarcode/tpm-key_attestation/blob/master/lib/tpm/constants.rb#L41
-	// 2.23.133.2.2 tcg-at-tpmModel TPM Model Number defined in EK Credential Profile for TPM 2.0
-	// 2.23.133.2.3 tcg-at-tpmVersion TPM Version defined in EK Credential Profile for TPM 2.0
-
-	// todo, understand why the following works...
-
-	// var sanOID asn1.ObjectIdentifier = []int{2, 5, 29, 17}
-	// for _, san := range ekcert.Extensions {
-	// 	if san.Id.Equal(sanOID) {
-	// 		glog.V(20).Infof("     EKCert SAN DirName: %s", san.Value)
-	// 		var seq asn1.RawValue
-	// 		var err error
-	// 		_, err = asn1.Unmarshal(san.Value, &seq)
-	// 		if err != nil {
-	// 			glog.Errorf("failed to unmarshal sequence " + err.Error())
-	// 			os.Exit(1)
-	// 		}
-
-	// 		var v asn1.RawValue
-	// 		_, err = asn1.Unmarshal(seq.Bytes, &v)
-	// 		if err != nil {
-	// 			glog.Errorf("failed to unmarshal sequenceBytes: " + err.Error())
-	// 			os.Exit(1)
-	// 		}
-
-	// 		var rdnSeq pkix.RDNSequence
-	// 		if _, err := asn1.Unmarshal(v.Bytes, &rdnSeq); err != nil {
-	// 			glog.Errorf("failed to Unmarshal name: " + err.Error())
-	// 			os.Exit(1)
-	// 		}
-	// 		var dirName pkix.Name
-	// 		dirName.FillFromRDNSequence(&rdnSeq)
-
-	// 		for _, n := range dirName.Names {
-	// 			glog.V(20).Infof("     DirName %s: %s", n.Type.String(), n.Value)
-	// 		}
-	// 	}
-	// }
 
 	intermediatePEM, err := os.ReadFile(*ekIntermediateCA)
 	if err != nil {
