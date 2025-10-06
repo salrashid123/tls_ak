@@ -14,7 +14,6 @@ import (
 	"io"
 	"math/big"
 	"net/http"
-	"net/url"
 	"slices"
 	"time"
 
@@ -36,6 +35,7 @@ import (
 	"github.com/google/go-attestation/attest"
 	"github.com/google/go-tpm-tools/simulator"
 	"github.com/google/go-tpm/tpmutil"
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
@@ -488,6 +488,8 @@ func main() {
 
 	// simulate creating a CSR to send to some CA
 	//  the spiffie and CN i'm just making up and is totally optional..its the serial number for the EK
+
+	deviceSerialNumber := uuid.New().String()
 	var csrtemplate = x509.CertificateRequest{
 		Subject: pkix.Name{
 			Organization:       []string{"Acme Co"},
@@ -495,13 +497,13 @@ func main() {
 			Locality:           []string{"Mountain View"},
 			Province:           []string{"California"},
 			Country:            []string{"US"},
-			CommonName:         ek.Certificate.SerialNumber.String(),
+			SerialNumber:       deviceSerialNumber,
+			CommonName:         fmt.Sprintf("tpm_server %s", deviceSerialNumber),
 		},
 		DNSNames: []string{*httpServerName},
-		URIs: []*url.URL{{
-			Scheme: "spiffie",
-			Host:   *httpServerName,
-			Path:   fmt.Sprintf("tcg-at-platformSerial/%s", ek.Certificate.SerialNumber.String()),
+		Extensions: []pkix.Extension{{
+			Id:    asn1.ObjectIdentifier{2, 5, 4, 5}, // id-at-serialNumber X520SerialNumber
+			Value: []byte(deviceSerialNumber),
 		}},
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}
@@ -551,12 +553,14 @@ func main() {
 			Locality:           []string{"Mountain View"},
 			Province:           []string{"California"},
 			Country:            []string{"US"},
+			SerialNumber:       clientCSR.Subject.SerialNumber,
 			CommonName:         clientCSR.Subject.CommonName, // from CSR
 		},
 		DNSNames:              clientCSR.DNSNames, // from CSR
 		URIs:                  clientCSR.URIs,
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
+		Extensions:            clientCSR.Extensions,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		PolicyIdentifiers:     []asn1.ObjectIdentifier{verifiedTPMResidency, verifiedTPMFixed},

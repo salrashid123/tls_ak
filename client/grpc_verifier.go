@@ -502,13 +502,14 @@ func main() {
 		// }
 	}
 
-	sb, err := attest.ParseSecurebootState(el.Events(attest.HashSHA1))
-	if err != nil {
-		glog.Errorf("Quote Parsing EventLog Failed: %v", err)
-		os.Exit(1)
-	}
+	// to check secure boot state:
+	// sb, err := attest.ParseSecurebootState(el.Events(attest.HashSHA1))
+	// if err != nil {
+	// 	glog.Errorf("Quote Parsing EventLog Failed: %v", err)
+	// 	os.Exit(1)
+	// }
 
-	glog.V(5).Infof("     secureBoot State enabled: [%t]", sb.Enabled)
+	// glog.V(5).Infof("     secureBoot State enabled: [%t]", sb.Enabled)
 
 	if _, err := el.Verify(serverPlatformAttestationParameter.PCRs); err != nil {
 		glog.Errorf("Quote Verify Failed: %v", err)
@@ -536,6 +537,25 @@ func main() {
 		glog.Errorf("error parsing tls certificate  %v", err)
 		os.Exit(1)
 	}
+
+	glog.V(10).Infof("        TLCertificate Issuer CN: %s\n", remoteTLScert.Issuer.CommonName)
+	glog.V(10).Infof("        TLCertificate Subjec : %s\n", remoteTLScert.Subject.String())
+
+	for _, ext := range remoteTLScert.Extensions {
+		glog.V(10).Infof("        Extension: OID: %s, Critical: %t, Value (DER): %x", ext.Id.String(), ext.Critical, ext.Value)
+	}
+
+	att_pubkey_bytes, err := x509.MarshalPKIXPublicKey(remoteTLScert.PublicKey)
+	if err != nil {
+		glog.V(10).Infof("ERROR:  Failed to marshall certificate publcikey: %s", err)
+	}
+	kpem := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "PUBLIC KEY",
+			Bytes: att_pubkey_bytes,
+		},
+	)
+	glog.V(5).Infof("       public key from cert \n%s\n", kpem)
 
 	// verify the tls key is certified by the AK
 	keyCertificationParameter := &attest.CertificationParameters{}
