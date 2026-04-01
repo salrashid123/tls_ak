@@ -62,12 +62,15 @@ for reference, see
 
 ### Setup
 
-There are two ways to test this:
+There are three ways to test this:
 
-1. locally with your laptop 
-2. on a cloud vm (eg GCP confidential VM with a TPM)
+1. locally with software tpm
+2. locally with your laptop's real TPM 
+3. on a cloud vm (eg GCP confidential VM with a TPM)
 
-In both cases, you'll need to have access to the eventlog on the attestor, eg this should return values only on the attestor
+In the first case, we will read a real tpm's eventlog and apply the pcr values into the swtpm
+
+in case 2 and 3, you'll need to have access to the eventlog on the attestor, eg this should return values only on the attestor
 
 ```bash
 sudo tpm2_eventlog /sys/kernel/security/tpm0/binary_bios_measurement
@@ -75,8 +78,275 @@ sudo tpm2_eventlog /sys/kernel/security/tpm0/binary_bios_measurement
 
 In both cases, the EK Cert needs to get verified to the roots so there is a bit of legwork in getting the cert chain setup
 
+#### SWTPM
 
-#### Local 
+If you want to test locally with a a software TPM, you will first need to install [swtpm](https://github.com/stefanberger/swtpm) and acquire an eventlog for quote/verify steps.
+
+Note, the follwoing uses a sample event log acquired from a GCE instance.  The eventlog from a real GCE instance is replayed and used to increment the PCR values.  In the end, the eventlog and pcr values will match for the software TPM
+
+First setup a swtpm with a named CA:
+
+```bash
+cd swtpm/
+
+export XDG_CONFIG_HOME=`pwd`/config/
+rm -rf myvtpm && mkdir myvtpm 
+swtpm_setup --tpmstate myvtpm --tpm2 --create-ek-cert --pcr-banks sha256 --create-platform-cert --write-ek-cert-files ekcerts/ 
+
+swtpm socket --tpmstate dir=myvtpm --tpm2 --server type=tcp,port=2321 --ctrl type=tcp,port=2322 --flags not-need-init,startup-clear --log level=2
+
+### then synchronize the eventlog's pcr values with the swtpm
+go run eventlog.go  --eventLogFile=binary_bios_measurements --tpm-path="127.0.0.1:2321"
+
+### so the current tpm2_pcrread
+export TPM2TOOLS_TCTI="swtpm:port=2321"
+
+$ tpm2_pcrread
+  sha256:
+    0 : 0xA0B5FF3383A1116BD7DC6DF177C0C2D433B9EE1813EA958FA5D166A202CB2A85
+    1 : 0xE50EDB964F66A7417954B1506F78A49D62062228CE84EE0B4E7E3B0E19B64A69
+    2 : 0x3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969
+    3 : 0x3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969
+    4 : 0xA3358453A5148B4E3F4B96B006AE1761A2CE4AEA75F6A13E10EB3E0903DFD6E2
+    5 : 0x098A2AE2D1AABED3E346B9FEF96EC64056EA4043514672243BBF40B7D0972302
+    6 : 0x3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969
+    7 : 0x0A3F60CEA411388B09EAC782999F5E62246AB5469F9047EB508AA22C4DCD2237
+    8 : 0xA775D521739876ECDE2C17D0E856C584EC513E8758D9199A3D5C735836BA0EBE
+    9 : 0x4A7254A1740444F04EC61CF3F8EB8FFB5DAE2069B44AD900E894B34A07626B36
+    10: 0x0000000000000000000000000000000000000000000000000000000000000000
+    11: 0x0000000000000000000000000000000000000000000000000000000000000000
+    12: 0x0000000000000000000000000000000000000000000000000000000000000000
+    13: 0x0000000000000000000000000000000000000000000000000000000000000000
+    14: 0x306F9D8B94F17D93DC6E7CF8F5C79D652EB4C6C4D13DE2DDDC24AF416E13ECAF
+    15: 0x0000000000000000000000000000000000000000000000000000000000000000
+    16: 0x0000000000000000000000000000000000000000000000000000000000000000
+    17: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+    18: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+    19: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+    20: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+    21: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+    22: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+    23: 0x0000000000000000000000000000000000000000000000000000000000000000
+
+### you'll see its the same as the eventlog's replay
+
+$ tpm2_eventlog binary_bios_measurements
+  sha256:
+    0  : 0xa0b5ff3383a1116bd7dc6df177c0c2d433b9ee1813ea958fa5d166a202cb2a85
+    1  : 0xe50edb964f66a7417954b1506f78a49d62062228ce84ee0b4e7e3b0e19b64a69
+    2  : 0x3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969
+    3  : 0x3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969
+    4  : 0xa3358453a5148b4e3f4b96b006ae1761a2ce4aea75f6a13e10eb3e0903dfd6e2
+    5  : 0x098a2ae2d1aabed3e346b9fef96ec64056ea4043514672243bbf40b7d0972302
+    6  : 0x3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969
+    7  : 0x0a3f60cea411388b09eac782999f5e62246ab5469f9047eb508aa22c4dcd2237
+    8  : 0xa775d521739876ecde2c17d0e856c584ec513e8758d9199a3d5c735836ba0ebe
+    9  : 0x4a7254a1740444f04ec61cf3f8eb8ffb5dae2069b44ad900e894b34a07626b36
+    14 : 0x306f9d8b94f17d93dc6e7cf8f5c79d652eb4c6c4d13de2dddc24af416e13ecaf
+```
+
+Then run the client and server
+
+Server:
+
+```bash
+go run server/grpc_attestor.go --grpcport :50051 --applicationPort :8081 \
+   --eventLogPath=swtpm/binary_bios_measurements  --tpmDevice="127.0.0.1:2321"  \
+        --v=60 -alsologtostderr
+
+I0331 23:26:10.297632   49799 grpc_attestor.go:326] Getting EKCert
+I0331 23:26:10.297742   49799 grpc_attestor.go:332] Opening swtpm socket
+I0331 23:26:10.299718   49799 grpc_attestor.go:363] ECCert with available Issuer: CN=swtpm-localca
+I0331 23:26:10.366991   49799 grpc_attestor.go:459] Generated ECC Public 
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9GJWWQPqcEr+TzyiTfc5d3/jYZki
+CCjyKZ4hpdgyohs3erXGEaQJ5VCxUQLFlS9WaA4Y44+frYVmNumsbNHTbA==
+-----END PUBLIC KEY-----
+I0331 23:26:10.367055   49799 grpc_attestor.go:472]         Issuing Cert ========
+I0331 23:26:10.374358   49799 grpc_attestor.go:609]         cert Issuer CN=Single Root TLS Issuer CA,OU=Enterprise,O=Google,C=US
+I0331 23:26:10.374476   49799 grpc_attestor.go:612]         Issued Certificate ========
+-----BEGIN CERTIFICATE-----
+MIIDdDCCAlygAwIBAgIQettKLu36WXZt9NzoPN5nvTANBgkqhkiG9w0BAQsFADBX
+MQswCQYDVQQGEwJVUzEPMA0GA1UECgwGR29vZ2xlMRMwEQYDVQQLDApFbnRlcnBy
+aXNlMSIwIAYDVQQDDBlTaW5nbGUgUm9vdCBUTFMgSXNzdWVyIENBMB4XDTI2MDQw
+MTAzMjYxMFoXDTI2MDQwMjAzMjYxMFowgcoxCzAJBgNVBAYTAlVTMRMwEQYDVQQI
+EwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1Nb3VudGFpbiBWaWV3MRAwDgYDVQQKEwdB
+Y21lIENvMRMwEQYDVQQLEwpFbnRlcnByaXNlMTgwNgYDVQQDDC90cG1fc2VydmVy
+IGQyNzhmODFlLTZhMTctNDFjYy04YTg5LTk1MmFlNTM5YzM1ODEtMCsGA1UEBRMk
+ZDI3OGY4MWUtNmExNy00MWNjLThhODktOTUyYWU1MzljMzU4MFkwEwYHKoZIzj0C
+AQYIKoZIzj0DAQcDQgAE9GJWWQPqcEr+TzyiTfc5d3/jYZkiCCjyKZ4hpdgyohs3
+erXGEaQJ5VCxUQLFlS9WaA4Y44+frYVmNumsbNHTbKOBkjCBjzAOBgNVHQ8BAf8E
+BAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADAfBgNVHSME
+GDAWgBRbzaql97VlJoV0gg2BK5pBDzb68DAaBgNVHREEEzARgg9lY2hvLmRvbWFp
+bi5jb20wHQYDVR0gBBYwFDAIBgZngQULAQEwCAYGZ4EFCwECMA0GCSqGSIb3DQEB
+CwUAA4IBAQAmNu8+F+rNNtR+UOYZWbGrEaAPSXqc+px3HWlEDMYff6Y0XdjjWPQy
+QB+K8W0eB2/aFRcObWhFInLwGxwzsYOLph/XSWU7z7qpWoAYGRGPmnx3NXpz0RkE
+DN/w529SxEOYYRzpDsgbodJ+DqQLWsuSfH8fMvIdnyRdn4+Eu4vo0RhZC5uOlGmf
+5vC11/Im5YQrVRp/JwqWB+oxYLwZz6ZrZQoIr3nDJKxQ/xs37wSvw6mq4+n/bmp3
+6IZpq5GeS2xfr4pTVBfhGGKU3zbaAgpDQe6dalOhrEGKJANvphMzf3UIZz7TCg1E
+2VeqI4KX4m2x6a8lAG/n8BsXWDylNlPd
+-----END CERTIFICATE-----
+
+I0331 23:26:10.374920   49799 grpc_attestor.go:626]         Issued certificate tied to PubicKey ========
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9GJWWQPqcEr+TzyiTfc5d3/jYZki
+CCjyKZ4hpdgyohs3erXGEaQJ5VCxUQLFlS9WaA4Y44+frYVmNumsbNHTbA==
+-----END PUBLIC KEY-----
+
+I0331 23:26:10.375236   49799 grpc_attestor.go:650] Starting HTTP Server on port :8081
+I0331 23:26:10.376002   49799 grpc_attestor.go:690] Starting gRPC server on port :50051
+usign signer
+I0331 23:26:17.488893   49799 grpc_attestor.go:180] ======= GetEK ========
+I0331 23:26:17.491294   49799 grpc_attestor.go:192] ======= GetAK ========
+I0331 23:26:17.495116   49799 grpc_attestor.go:215] ======= Attest ========
+I0331 23:26:17.515873   49799 grpc_attestor.go:249] ======= Quote ========
+I0331 23:26:17.535460   49799 grpc_attestor.go:286] ======= GetTLSKey ========
+usign signer
+I0331 23:26:17.542684   49799 grpc_attestor.go:310] Inbound HTTP request from: 127.0.0.1
+```
+
+Run the client
+
+```bash
+go run client/grpc_verifier.go --host=127.0.0.1:50051  \
+  --appaddress=$ATTESTOR_ADDRESS:8081  \
+     --ekrootCA swtpm/config/var/lib/swtpm-localca/issuercert.pem  --expectedPCRMapSHA256=0:a0b5ff3383a1116bd7dc6df177c0c2d433b9ee1813ea958fa5d166a202cb2a85  \
+        --v=60 -alsologtostder
+
+I0331 23:26:17.480152   49962 grpc_verifier.go:95] =============== start GetEK ===============
+I0331 23:26:17.489631   49962 grpc_verifier.go:235]         EKCertificate ========
+-----BEGIN CERTIFICATE-----
+MIID9TCCAl2gAwIBAgICBKswDQYJKoZIhvcNAQELBQAwGDEWMBQGA1UEAxMNc3d0
+cG0tbG9jYWxjYTAgFw0yNjA0MDEwMzAzNTZaGA85OTk5MTIzMTIzNTk1OVowEjEQ
+MA4GA1UEAxMHdW5rbm93bjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
+AMFnrCATC9OHIe/G0Jq6FVeTzblT/DFg+GMn91D2uSuhl4y2jz9M0+bGUhXQpLH9
+Nx17f3YO64UuwKUvvNQO81fE6q9V98sYj91an6o5CvMVgt2jXUxQJyQXoqLOjwul
+KWyyDf82fCWyQ7BcQi73cT7xLx7aCHnZfm09pih/2nKbXEzuicmt8OuQtzQqf5+F
+6Qg8j/UHKIPZEEZn2c3//6C1641/0bRJBm8sT3iU0VhhlRTBEidsIV2Ihte1GEzy
+RxXlKqhMXxEx/HpSflHjWgJ0E99m2dgEPq+saqCMaxNc0N9XUIkwgQ3/dRG4mwaU
+bSg+6EC5m93KWCfDybacRI8CAwEAAaOBzDCByTAQBgNVHSUECTAHBgVngQUIATBS
+BgNVHREBAf8ESDBGpEQwQjEWMBQGBWeBBQIBDAtpZDowMDAwMTAxNDEQMA4GBWeB
+BQICDAVzd3RwbTEWMBQGBWeBBQIDDAtpZDoyMDI0MDEyNTAMBgNVHRMBAf8EAjAA
+MCIGA1UdCQQbMBkwFwYFZ4EFAhAxDjAMDAMyLjACAQACAgC3MB8GA1UdIwQYMBaA
+FC9tUdt3Nuy5Lc3iJ4AxyLHsw4e0MA4GA1UdDwEB/wQEAwIFIDANBgkqhkiG9w0B
+AQsFAAOCAYEAclj9YE+Js0ijbG+j+EoHoAtKyDgtgbwgMjaArb+j9IPBqumfueZ8
+NErj24kRNYZOtFQluYOsqRbvdhx8TPaq5LRF8uDXBuL8F4EXdWajfQA6kJTQAuEf
+uBdUTf52ReZoi7b2HjiSB1wMh/REfdHtoGcDK4kvlIDdizoO4lcbbNUqic2mbm4l
+G0L5L9vAcwbIzSxvH9nmmbTkdrcShGsbR6+UJQCwpo2w7+NsTbpDNTh2KiDfe5H6
+JxFrGa2E66IcYs/a7Hme+pWun3pOnikozpWCdLxAFp8f5dFa7yB4k45fUVKbKI3S
+B8HCk26KupY+WdZlTMRLL7T/anN++oF5C2XZfNhpSlTwgAGeywYb9vWLogQhRqJ1
+WemklsmV8gA6bK8mPSbRwvEiIn24DplFfyUm8wovTr1zMD0PxfkMurvXLc0XM7e9
+fBfOlGjii6iAhEG+VmJw/IoUdiU8wbSKSjkTr0qXVCF8YttFIyc4Hjio63djc8YH
+kivVZCjiN4v2
+-----END CERTIFICATE-----
+
+I0331 23:26:17.489755   49962 grpc_verifier.go:251]      EKCert  Issuer CN=swtpm-localca
+I0331 23:26:17.489799   49962 grpc_verifier.go:252]      EKCert  IssuingCertificateURL []
+I0331 23:26:17.489825   49962 grpc_verifier.go:257]     Verifying EKCert
+I0331 23:26:17.490104   49962 grpc_verifier.go:285]      EKCert Includes tcg-kp-EKCertificate ExtendedKeyUsage 2.23.133.8.1
+I0331 23:26:17.490598   49962 grpc_verifier.go:315]     EKCert Verified
+I0331 23:26:17.490629   49962 grpc_verifier.go:317]      EKPub: 
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwWesIBML04ch78bQmroV
+V5PNuVP8MWD4Yyf3UPa5K6GXjLaPP0zT5sZSFdCksf03HXt/dg7rhS7ApS+81A7z
+V8Tqr1X3yxiP3VqfqjkK8xWC3aNdTFAnJBeios6PC6UpbLIN/zZ8JbJDsFxCLvdx
+PvEvHtoIedl+bT2mKH/acptcTO6Jya3w65C3NCp/n4XpCDyP9Qcog9kQRmfZzf//
+oLXrjX/RtEkGbyxPeJTRWGGVFMESJ2whXYiG17UYTPJHFeUqqExfETH8elJ+UeNa
+AnQT32bZ2AQ+r6xqoIxrE1zQ31dQiTCBDf91EbibBpRtKD7oQLmb3cpYJ8PJtpxE
+jwIDAQAB
+-----END PUBLIC KEY-----
+
+I0331 23:26:17.490683   49962 grpc_verifier.go:333] =============== end GetEKCert ===============
+I0331 23:26:17.490716   49962 grpc_verifier.go:336] =============== start GetAK ===============
+I0331 23:26:17.493934   49962 grpc_verifier.go:369]       ak public 
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArRC/d6/GU1F8N8Njgi6L
+bOTiAQnfs6rmNdGNnLZLPgP9l0n3n/V8BDdp98LstryLYFUhp8uLtxnxRI1Gpuqx
+zxa60qryGvL1Bhm56y1RIkFO28/vZqRm7OO0Hmn0gqfRstPZuZPA+d1LKMBBYGvh
+MGxbDZRvn+kYJC5DkGBKoV7rJe3/xXKY2st9s2p7pHWyToTLLNnTfOmXMJ7V6z7n
+m3f7JJuxVppP56Dpeiizx0iNE2CYWN/ve+HMZX6jF5Le8nABj5+Yh5mTnsneyeDg
+qMt/k6JCxzIu3/BVSjirHtA7dPIlg6bqwUtMUq7+lnqAQ29JClXOLx/9ZSolRtuS
+2wIDAQAB
+-----END PUBLIC KEY-----
+
+I0331 23:26:17.494017   49962 grpc_verifier.go:370] =============== end GetAK ===============
+I0331 23:26:17.494093   49962 grpc_verifier.go:373] =============== start Attest ===============
+I0331 23:26:17.494560   49962 grpc_verifier.go:386]       Outbound Secret: V+yw8OpH7sJfjBr2Q6DymsmOPLoSk0Zqilr11OObJsc=
+I0331 23:26:17.515036   49962 grpc_verifier.go:402]       Inbound Secret: V+yw8OpH7sJfjBr2Q6DymsmOPLoSk0Zqilr11OObJsc=
+I0331 23:26:17.515133   49962 grpc_verifier.go:405]       inbound/outbound Secrets Match; accepting AK
+I0331 23:26:17.515181   49962 grpc_verifier.go:410] =============== end Attest ===============
+I0331 23:26:17.515222   49962 grpc_verifier.go:413] =============== start Quote/Verify ===============
+I0331 23:26:17.533704   49962 grpc_verifier.go:458]       quote-attested public 
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArRC/d6/GU1F8N8Njgi6L
+bOTiAQnfs6rmNdGNnLZLPgP9l0n3n/V8BDdp98LstryLYFUhp8uLtxnxRI1Gpuqx
+zxa60qryGvL1Bhm56y1RIkFO28/vZqRm7OO0Hmn0gqfRstPZuZPA+d1LKMBBYGvh
+MGxbDZRvn+kYJC5DkGBKoV7rJe3/xXKY2st9s2p7pHWyToTLLNnTfOmXMJ7V6z7n
+m3f7JJuxVppP56Dpeiizx0iNE2CYWN/ve+HMZX6jF5Le8nABj5+Yh5mTnsneyeDg
+qMt/k6JCxzIu3/BVSjirHtA7dPIlg6bqwUtMUq7+lnqAQ29JClXOLx/9ZSolRtuS
+2wIDAQAB
+-----END PUBLIC KEY-----
+
+I0331 23:26:17.534111   49962 grpc_verifier.go:485]      quotes verified
+I0331 23:26:17.534635   49962 grpc_verifier.go:521] =============== end Quote/Verify ===============
+I0331 23:26:17.534691   49962 grpc_verifier.go:524] =============== start NewKey ===============
+I0331 23:26:17.536939   49962 grpc_verifier.go:536]         TLSCertificate ========
+-----BEGIN CERTIFICATE-----
+MIIDdDCCAlygAwIBAgIQettKLu36WXZt9NzoPN5nvTANBgkqhkiG9w0BAQsFADBX
+MQswCQYDVQQGEwJVUzEPMA0GA1UECgwGR29vZ2xlMRMwEQYDVQQLDApFbnRlcnBy
+aXNlMSIwIAYDVQQDDBlTaW5nbGUgUm9vdCBUTFMgSXNzdWVyIENBMB4XDTI2MDQw
+MTAzMjYxMFoXDTI2MDQwMjAzMjYxMFowgcoxCzAJBgNVBAYTAlVTMRMwEQYDVQQI
+EwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1Nb3VudGFpbiBWaWV3MRAwDgYDVQQKEwdB
+Y21lIENvMRMwEQYDVQQLEwpFbnRlcnByaXNlMTgwNgYDVQQDDC90cG1fc2VydmVy
+IGQyNzhmODFlLTZhMTctNDFjYy04YTg5LTk1MmFlNTM5YzM1ODEtMCsGA1UEBRMk
+ZDI3OGY4MWUtNmExNy00MWNjLThhODktOTUyYWU1MzljMzU4MFkwEwYHKoZIzj0C
+AQYIKoZIzj0DAQcDQgAE9GJWWQPqcEr+TzyiTfc5d3/jYZkiCCjyKZ4hpdgyohs3
+erXGEaQJ5VCxUQLFlS9WaA4Y44+frYVmNumsbNHTbKOBkjCBjzAOBgNVHQ8BAf8E
+BAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADAfBgNVHSME
+GDAWgBRbzaql97VlJoV0gg2BK5pBDzb68DAaBgNVHREEEzARgg9lY2hvLmRvbWFp
+bi5jb20wHQYDVR0gBBYwFDAIBgZngQULAQEwCAYGZ4EFCwECMA0GCSqGSIb3DQEB
+CwUAA4IBAQAmNu8+F+rNNtR+UOYZWbGrEaAPSXqc+px3HWlEDMYff6Y0XdjjWPQy
+QB+K8W0eB2/aFRcObWhFInLwGxwzsYOLph/XSWU7z7qpWoAYGRGPmnx3NXpz0RkE
+DN/w529SxEOYYRzpDsgbodJ+DqQLWsuSfH8fMvIdnyRdn4+Eu4vo0RhZC5uOlGmf
+5vC11/Im5YQrVRp/JwqWB+oxYLwZz6ZrZQoIr3nDJKxQ/xs37wSvw6mq4+n/bmp3
+6IZpq5GeS2xfr4pTVBfhGGKU3zbaAgpDQe6dalOhrEGKJANvphMzf3UIZz7TCg1E
+2VeqI4KX4m2x6a8lAG/n8BsXWDylNlPd
+-----END CERTIFICATE-----
+
+I0331 23:26:17.537100   49962 grpc_verifier.go:544]         TLCertificate Issuer CN: Single Root TLS Issuer CA
+I0331 23:26:17.537170   49962 grpc_verifier.go:545]         TLCertificate Subjec : SERIALNUMBER=d278f81e-6a17-41cc-8a89-952ae539c358,CN=tpm_server d278f81e-6a17-41cc-8a89-952ae539c358,OU=Enterprise,O=Acme Co,L=Mountain View,ST=California,C=US
+I0331 23:26:17.537219   49962 grpc_verifier.go:548]         Extension: OID: 2.5.29.15, Critical: true, Value (DER): 03020780
+I0331 23:26:17.537276   49962 grpc_verifier.go:548]         Extension: OID: 2.5.29.37, Critical: false, Value (DER): 300a06082b06010505070301
+I0331 23:26:17.537293   49962 grpc_verifier.go:548]         Extension: OID: 2.5.29.19, Critical: true, Value (DER): 3000
+I0331 23:26:17.537301   49962 grpc_verifier.go:548]         Extension: OID: 2.5.29.35, Critical: false, Value (DER): 301680145bcdaaa5f7b565268574820d812b9a410f36faf0
+I0331 23:26:17.537310   49962 grpc_verifier.go:548]         Extension: OID: 2.5.29.17, Critical: false, Value (DER): 3011820f6563686f2e646f6d61696e2e636f6d
+I0331 23:26:17.537317   49962 grpc_verifier.go:548]         Extension: OID: 2.5.29.32, Critical: false, Value (DER): 3014300806066781050b0101300806066781050b0102
+I0331 23:26:17.537349   49962 grpc_verifier.go:561]        public key from cert 
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9GJWWQPqcEr+TzyiTfc5d3/jYZki
+CCjyKZ4hpdgyohs3erXGEaQJ5VCxUQLFlS9WaA4Y44+frYVmNumsbNHTbA==
+-----END PUBLIC KEY-----
+
+I0331 23:26:17.537663   49962 grpc_verifier.go:632]      Certified TPMNTPublic key matches public key in x509 certificate
+I0331 23:26:17.537718   49962 grpc_verifier.go:638]      TLS key verified
+I0331 23:26:17.537773   49962 grpc_verifier.go:639] =============== end NewKey ===============
+I0331 23:26:17.537826   49962 grpc_verifier.go:642] =============== start http client ===============
+I0331 23:26:17.542137   49962 grpc_verifier.go:707]       Issuer CN=Single Root TLS Issuer CA,OU=Enterprise,O=Google,C=US
+I0331 23:26:17.542211   49962 grpc_verifier.go:720]        peer public key 
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9GJWWQPqcEr+TzyiTfc5d3/jYZki
+CCjyKZ4hpdgyohs3erXGEaQJ5VCxUQLFlS9WaA4Y44+frYVmNumsbNHTbA==
+-----END PUBLIC KEY-----
+
+I0331 23:26:17.542230   49962 grpc_verifier.go:729]      peer tls public key matched attested key
+I0331 23:26:17.542253   49962 grpc_verifier.go:736]      Connected to IP: 127.0.0.1
+I0331 23:26:17.542948   49962 grpc_verifier.go:755] 200 OK
+I0331 23:26:17.543049   49962 grpc_verifier.go:756] ok
+
+```
+
+
+#### Local TPM
 
 You can also verify this demo locally if your user has access to both the TPM and the event log. 
 
