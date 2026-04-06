@@ -470,6 +470,10 @@ func main() {
 	}
 
 	for _, p := range serverPlatformAttestationParameter.PCRs {
+		if !p.QuoteVerified() {
+			glog.Errorf("Quote Failed Verify for PCR [%d] %v", p.Index, err)
+			os.Exit(1)
+		}
 		glog.V(20).Infof("     PCR: %d, verified: %t value: %s", p.Index, p.QuoteVerified(), hex.EncodeToString((p.Digest)))
 		if p.DigestAlg == crypto.SHA256 {
 			v, ok := pcrMap[uint32(p.Index)]
