@@ -25,12 +25,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/google/go-attestation/attest"
 	x509ext "github.com/google/go-attestation/x509"
-
 	"github.com/google/uuid"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/google/go-tpm-tools/proto/tpm"
 	"github.com/google/go-tpm-tools/server"
@@ -90,6 +91,46 @@ func main() {
 	}
 	defer conn.Close()
 
+	glog.V(5).Infof("=============== HealthCheck ===============")
+
+	pr := new(peer.Peer)
+
+	hctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	resp, err := healthpb.NewHealthClient(conn).Check(hctx, &healthpb.HealthCheckRequest{Service: verifier.Verifier_ServiceDesc.ServiceName}, grpc.Peer(pr))
+	if err != nil {
+		glog.Errorf("HealthCheck failed %+v", err)
+		os.Exit(1)
+	}
+
+	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		glog.Errorf("service not in serving state: ", resp.GetStatus().String())
+		os.Exit(1)
+	}
+	glog.V(5).Infof("RPC HealthChekStatus: %v\n", resp.GetStatus())
+
+	switch info := pr.AuthInfo.(type) {
+	case credentials.TLSInfo:
+		authType := info.AuthType()
+		sn := info.State.ServerName
+		glog.V(60).Infof("AuthType, ServerName %s, %s\n", authType, sn)
+		tlsInfo, ok := pr.AuthInfo.(credentials.TLSInfo)
+		if !ok {
+			glog.Errorf("ERROR:  Could get remote TLS")
+			os.Exit(1)
+		}
+		ekm, err := tlsInfo.State.ExportKeyingMaterial("EXPORTER-my_label", []byte("mycontext"), 32)
+		if err != nil {
+			glog.Errorf("ERROR:  Could getting EKM %v", err)
+			os.Exit(1)
+		}
+		glog.V(10).Infof("EKM: %s\n", hex.EncodeToString(ekm))
+
+	default:
+		glog.Errorf("Unknown AuthInfo type")
+		os.Exit(1)
+	}
+
 	// get the EKCert;  you can also 'just read' it from certs/ekcert.epm
 	//  if you downloaded it earlier and trust it; its verified later against roots.
 	glog.V(5).Infof("=============== start GetEK ===============")
@@ -98,31 +139,9 @@ func main() {
 
 	c := verifier.NewVerifierClient(conn)
 
-	pr := new(peer.Peer)
 	ekResponse, err := c.GetEK(ctx, ekReq, grpc.Peer(pr))
 	if err != nil {
 		glog.Errorf("GetEK Failed,   Original Error is: %v", err)
-		os.Exit(1)
-	}
-
-	switch info := pr.AuthInfo.(type) {
-	case credentials.TLSInfo:
-		authType := info.AuthType()
-		sn := info.State.ServerName
-		glog.V(20).Infof("        AuthType, ServerName %s, %s\n", authType, sn)
-		tlsInfo, ok := pr.AuthInfo.(credentials.TLSInfo)
-		if !ok {
-			glog.Errorf("ERROR:  Could get remote TLS")
-			os.Exit(1)
-		}
-		ekm, err := tlsInfo.State.ExportKeyingMaterial("my_nonce", nil, 32)
-		if err != nil {
-			glog.Errorf("ERROR:  Could getting EKM %v", err)
-			os.Exit(1)
-		}
-		glog.V(20).Infof("        EKM my_nonce: %s\n", hex.EncodeToString(ekm))
-	default:
-		glog.Errorf("Unknown AuthInfo type")
 		os.Exit(1)
 	}
 
@@ -696,7 +715,7 @@ func main() {
 			if err != nil {
 				return nil, fmt.Errorf("exportKeyingMaterial failed: %v", err)
 			}
-			glog.V(30).Infof("  EKM my_nonce: %s\n", hex.EncodeToString(ekm))
+			glog.V(30).Infof("  EKM my_nonce for HTTPS: %s\n", hex.EncodeToString(ekm))
 
 			// extract the peer certificate.
 			// this is the EC key and local ca-signed cert
@@ -744,18 +763,18 @@ func main() {
 
 	client := &http.Client{Transport: tr}
 
-	resp, err := client.Get(fmt.Sprintf("https://%s", *appaddress))
+	hresp, err := client.Get(fmt.Sprintf("https://%s", *appaddress))
 	if err != nil {
 		glog.Errorf("Error Reading new host %v", err)
 		os.Exit(1)
 	}
 
-	htmlData, err := io.ReadAll(resp.Body)
+	htmlData, err := io.ReadAll(hresp.Body)
 	if err != nil {
 		glog.Errorf("Error calling new dynamic host %v", err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
+	defer hresp.Body.Close()
 	glog.V(5).Infof("%v\n", resp.Status)
 	glog.V(5).Infof(string(htmlData))
 

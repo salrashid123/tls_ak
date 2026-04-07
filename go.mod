@@ -1,23 +1,23 @@
 module main
 
-go 1.22.10
+go 1.24.0
 
 require (
-	github.com/golang/glog v1.2.2
+	github.com/golang/glog v1.2.5
 	github.com/google/go-attestation v0.5.1
 	github.com/google/go-tpm v0.9.1
 	github.com/google/go-tpm-tools v0.4.4
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
 	github.com/salrashid123/tls_ak/verifier v0.0.0
-	golang.org/x/net v0.31.0
-	golang.org/x/sync v0.10.0
-	google.golang.org/grpc v1.69.2
+	golang.org/x/net v0.49.0
+	golang.org/x/sync v0.19.0
+	google.golang.org/grpc v1.80.0
 )
 
 //github.com/salrashid123/gcp-vtpm-ek-ak/parser v0.0.0-20241230103405-619d349db58b
 
-require golang.org/x/crypto v0.31.0 // indirect
+require golang.org/x/crypto v0.47.0 // indirect
 
 require (
 	github.com/golang/protobuf v1.5.4 // indirect
@@ -30,10 +30,10 @@ require (
 	github.com/pborman/uuid v1.2.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20241113202542-65e8d215514f // indirect
-	google.golang.org/protobuf v1.35.2 // indirect
+	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/text v0.33.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 )
 
 replace github.com/salrashid123/tls_ak/verifier => ./verifier

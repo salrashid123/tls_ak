@@ -54,6 +54,13 @@ for reference, see
 * [BlindLlama TLS](https://blindllama.mithrilsecurity.io/en/latest/docs/concepts/TPMs/) 
 * [TPM 2.0 Keys for Device Identity and Attestation](https://trustedcomputinggroup.org/wp-content/uploads/TPM-2p0-Keys-for-Device-Identity-and-Attestation_v1_r12_pub10082021.pdf) (`5.2 OEM Creation of IAK and IDevID in a Single Pass`)
 
+
+Note that prior to the start of this protocol, the Attestor creates a gRPC [HealthCheck](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) request over mTLS to the Attestor.
+
+The TLS connection for that request returns a unique connection-specific [Exported Key Material](https://github.com/salrashid123/go_ekm_tls).  This `EKM` value is unique to the connection and is derived simultaneously by both the client and server.  The EKM value is used to populate the an internal session database on the Verifier for each of the steps from step `6` to step `11` after which the EKM entry in the datatabase is discarded.  This means that those steps 6->11 *must* be done on the same TLS session.
+
+
+
 ---
 
 >> NOTE: this repo and code is *not* supported by google
@@ -152,7 +159,7 @@ Server:
 ```bash
 go run server/grpc_attestor.go --grpcport :50051 --applicationPort :8081 \
    --eventLogPath=swtpm/binary_bios_measurements  --tpmDevice="127.0.0.1:2321"  \
-        --v=60 -alsologtostderr
+        --v=60
 
 I0331 23:26:10.297632   49799 grpc_attestor.go:326] Getting EKCert
 I0331 23:26:10.297742   49799 grpc_attestor.go:332] Opening swtpm socket
@@ -211,7 +218,7 @@ Run the client
 go run client/grpc_verifier.go --host=127.0.0.1:50051  \
   --appaddress=$ATTESTOR_ADDRESS:8081  \
      --ekrootCA swtpm/config/var/lib/swtpm-localca/issuercert.pem  --expectedPCRMapSHA256=0:a0b5ff3383a1116bd7dc6df177c0c2d433b9ee1813ea958fa5d166a202cb2a85  \
-        --v=60 -alsologtostder
+        --v=60 
 
 I0331 23:26:17.480152   49962 grpc_verifier.go:95] =============== start GetEK ===============
 I0331 23:26:17.489631   49962 grpc_verifier.go:235]         EKCertificate ========
@@ -504,7 +511,7 @@ go run server/grpc_attestor.go --grpcport :50051 --applicationPort :8081  --v=10
 
 export ATTESTOR_ADDRESS=127.0.0.1
 go run client/grpc_verifier.go --host=127.0.0.1:50051 \
-   --appaddress=$ATTESTOR_ADDRESS:8081      --ekintermediateCA=certs/stsafetpmrsaint10.pem  --ekrootCA=certs/stmtpmekroot.pem  --expectedPCRMapSHA256=0:7bb4353897632fd086982175a027dafcc33f61adbab4ebfc6d13927b97a8c084     --v=10 -alsologtostderr
+   --appaddress=$ATTESTOR_ADDRESS:8081      --ekintermediateCA=certs/stsafetpmrsaint10.pem  --ekrootCA=certs/stmtpmekroot.pem  --expectedPCRMapSHA256=0:7bb4353897632fd086982175a027dafcc33f61adbab4ebfc6d13927b97a8c084     --v=10 
 ```
 
 The output is like this on both ends
@@ -517,7 +524,7 @@ $ go run client/grpc_verifier.go --host=127.0.0.1:50051 \
       --ekintermediateCA=certs/stsafetpmrsaint10.pem  \
        --ekrootCA=certs/stmtpmekroot.pem \
         --expectedPCRMapSHA256=0:7bb4353897632fd086982175a027dafcc33f61adbab4ebfc6d13927b97a8c084 \
-            --v=10 -alsologtostderr
+            --v=10
 
 I1004 15:17:10.506757 3468104 grpc_verifier.go:95] =============== start GetEK ===============
 I1004 15:17:10.516616 3468104 grpc_verifier.go:235]         EKCertificate ========
@@ -659,7 +666,7 @@ I1004 15:17:19.698690 3468104 grpc_verifier.go:753] ok
 #### Attestor
 
 ```bash
-$ sudo go run server/grpc_attestor.go --grpcport :50051 --applicationPort :8081  --v=30 -alsologtostderr
+$ sudo go run server/grpc_attestor.go --grpcport :50051 --applicationPort :8081  --v=30
 
 I1004 15:17:00.757803 3467978 grpc_attestor.go:317] Getting EKCert
 I1004 15:17:00.775051 3467978 grpc_attestor.go:337] ECCert with available Issuer: CN=STSAFE TPM RSA Intermediate CA 10,O=STMicroelectronics NV,C=CH
@@ -802,7 +809,7 @@ SSH to the attestor, [install golang](https://go.dev/doc/install) and run
 ```bash
 $ git clone https://github.com/salrashid123/tls_ak.git
 
-$ go run server/grpc_attestor.go --grpcport :50051 --applicationPort :8081 --v=10 -alsologtostderr
+$ go run server/grpc_attestor.go --grpcport :50051 --applicationPort :8081 --v=10
 ```
 
 install [tpm2-tools](https://tpm2-tools.readthedocs.io/en/latest/INSTALL/) (`apt-get install tpm2-tools`) and print out the PCR=0 value. 
@@ -826,7 +833,7 @@ On the laptop, run the verifier (remember to specify the expected lowercase PCR 
 $ go run client/grpc_verifier.go --host=$ATTESTOR_ADDRESS:50051 \
    --appaddress=$ATTESTOR_ADDRESS:8081 \
    --expectedPCRMapSHA256=0:a0b5ff3383a1116bd7dc6df177c0c2d433b9ee1813ea958fa5d166a202cb2a85 \
-    --v=10 -alsologtostderr
+    --v=10
 ```
 
 ---

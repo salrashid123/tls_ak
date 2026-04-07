@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/tls"
@@ -14,7 +15,9 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"os/signal"
 	"slices"
+	"syscall"
 	"time"
 
 	"flag"
@@ -33,11 +36,11 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/google/go-attestation/attest"
-	"github.com/google/go-tpm-tools/simulator"
 	"github.com/google/go-tpm/tpmutil"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
@@ -64,7 +67,22 @@ var (
 	akbytes           []byte
 	nkBytes           []byte
 	issuedTLSderBytes []byte
+
+	attestationKeys = make(map[string]db) // map which holds the EKM value for a session and the database of attestation state
 )
+
+type db struct {
+	//PlatformCert          *attributecert.AttributeCertificate // todo: read a platform cert and optionall return this to the verifier
+	EKCert                *x509.Certificate
+	AKPub                 crypto.PublicKey
+	AttestationParameters *attest.AttestationParameters
+	Attested              bool
+	Secret                []byte
+	IssuedKey             *ecdsa.PublicKey
+	IssuedCert            *x509.Certificate
+	Nonce                 []byte
+	AttestedKey           crypto.PublicKey
+}
 
 const ()
 
@@ -73,8 +91,6 @@ var TPMDEVICES = []string{"/dev/tpm0", "/dev/tpmrm0"}
 func openTPM(path string) (io.ReadWriteCloser, error) {
 	if slices.Contains(TPMDEVICES, path) {
 		return tpmutil.OpenTPM(path)
-	} else if path == "simulator" {
-		return simulator.GetWithFixedSeedInsecure(1073741825)
 	} else {
 		return net.Dial("tcp", path)
 	}
@@ -92,6 +108,11 @@ func (cc *linuxCmdChannel) MeasurementLog() ([]byte, error) {
 type server struct {
 	mu      sync.Mutex
 	running bool
+
+	// statusMap stores the serving status of the services this Server monitors.
+	statusMap map[string]healthpb.HealthCheckResponse_ServingStatus
+	// Embed the unimplemented server
+	verifier.UnimplementedVerifierServer
 }
 
 type contextKey string
@@ -102,6 +123,55 @@ type event struct {
 	PeerCertificates []*x509.Certificate
 	EKM              string
 	PeerIP           string
+}
+
+func (s *server) Check(ctx context.Context, in *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	evt := ctx.Value(contextKey("event")).(event)
+	glog.V(60).Infof("     Inbound gRPC request from: %s", evt.PeerIP)
+	glog.V(60).Infof("     Inbound EKM: %s", evt.EKM)
+
+	if in.Service == "" {
+		// return overall status
+		return &healthpb.HealthCheckResponse{Status: healthpb.HealthCheckResponse_SERVING}, nil
+	}
+
+	s.statusMap[verifier.Verifier_ServiceDesc.ServiceName] = healthpb.HealthCheckResponse_SERVING
+
+	status, ok := s.statusMap[in.Service]
+	if !ok {
+		return &healthpb.HealthCheckResponse{Status: healthpb.HealthCheckResponse_UNKNOWN}, grpc.Errorf(codes.NotFound, "unknown service")
+	}
+
+	// todo: optionally fill this in
+	attestationKeys[evt.EKM] = db{
+		EKCert: ekCert,
+	}
+
+	return &healthpb.HealthCheckResponse{Status: status}, nil
+}
+
+func (s *server) Watch(in *healthpb.HealthCheckRequest, srv healthpb.Health_WatchServer) error {
+	return status.Error(codes.Unimplemented, "Watch is not implemented")
+}
+
+func (s *server) List(ctx context.Context, in *healthpb.HealthListRequest) (*healthpb.HealthListResponse, error) {
+	r := make(map[string]*healthpb.HealthCheckResponse)
+
+	r[verifier.Verifier_ServiceDesc.ServiceName] = &healthpb.HealthCheckResponse{
+		Status: healthpb.HealthCheckResponse_SERVING,
+	}
+	return &healthpb.HealthListResponse{Statuses: r}, nil
+}
+
+// NewServer returns a new Server.
+func NewServer() *server {
+	return &server{
+		running:   true,
+		statusMap: make(map[string]healthpb.HealthCheckResponse_ServingStatus),
+	}
 }
 
 func authUnaryInterceptor(
@@ -179,6 +249,19 @@ func eventsMiddleware(h http.Handler) http.Handler {
 func (s *server) GetEK(ctx context.Context, in *verifier.GetEKRequest) (*verifier.GetEKResponse, error) {
 	glog.V(2).Infof("======= GetEK ========")
 
+	evt := ctx.Value(contextKey("event")).(event)
+	glog.V(60).Infof("     Inbound gRPC request from: %s", evt.PeerIP)
+	glog.V(60).Infof("     Inbound EKM: %s", evt.EKM)
+	if val, ok := attestationKeys[evt.EKM]; ok {
+		if val.EKCert == nil {
+			glog.Errorf("Error MakeCrGetEKedential requires HealthCheck was called first [%s]", evt.EKM)
+			return &verifier.GetEKResponse{}, status.Errorf(codes.Internal, "Error GetEK v")
+		}
+	} else {
+		glog.Errorf("Error GetEK requires HealthCheck was called first  [%s]", evt.EKM)
+		return &verifier.GetEKResponse{}, status.Errorf(codes.Internal, "Error GetEK requires HealthCheck was called first")
+	}
+
 	return &verifier.GetEKResponse{
 		EkPub:  ekpubBytes,
 		EkCert: ekCert.Raw,
@@ -190,6 +273,19 @@ func (s *server) GetAK(ctx context.Context, in *verifier.GetAKRequest) (*verifie
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	glog.V(2).Infof("======= GetAK ========")
+
+	evt := ctx.Value(contextKey("event")).(event)
+	glog.V(60).Infof("     Inbound gRPC request from: %s", evt.PeerIP)
+	glog.V(60).Infof("     Inbound EKM: %s", evt.EKM)
+	if _, ok := attestationKeys[evt.EKM]; ok {
+		if akbytes == nil {
+			glog.Errorf("Error GetAK requires HealthCheck and GetEK was called first [%s]", evt.EKM)
+			return &verifier.GetAKResponse{}, status.Errorf(codes.Internal, "Error HealthCheck and GetEK was called first v")
+		}
+	} else {
+		glog.Errorf("Error GetAK requires HealthCheck was called first  [%s]", evt.EKM)
+		return &verifier.GetAKResponse{}, status.Errorf(codes.Internal, "Error GetAK requires HealthCheck was called first")
+	}
 
 	ak, err := tpm.LoadAK(akbytes)
 	if err != nil {
@@ -214,9 +310,19 @@ func (s *server) Attest(ctx context.Context, in *verifier.AttestRequest) (*verif
 	defer s.mu.Unlock()
 	glog.V(2).Infof("======= Attest ========")
 
-	val := ctx.Value(contextKey("event")).(event)
-	glog.V(60).Infof("     Inbound gRPC request from: %s", val.PeerIP)
-	glog.V(60).Infof("     Inbound EKM: %s", val.EKM)
+	evt := ctx.Value(contextKey("event")).(event)
+	glog.V(60).Infof("     Inbound gRPC request from: %s", evt.PeerIP)
+	glog.V(60).Infof("     Inbound EKM: %s", evt.EKM)
+
+	if _, ok := attestationKeys[evt.EKM]; ok {
+		if akbytes == nil {
+			glog.Errorf("Error Attest requires HealthCheck and GetEK and GetAK was called first [%s]", evt.EKM)
+			return &verifier.AttestResponse{}, status.Errorf(codes.Internal, "Error HealthCheck and and GetEK and GetAK  called first")
+		}
+	} else {
+		glog.Errorf("Error Attest requires HealthCheck was called first  [%s]", evt.EKM)
+		return &verifier.AttestResponse{}, status.Errorf(codes.Internal, "Error Attest requires HealthCheck and GetEK  called first")
+	}
 
 	ak, err := tpm.LoadAK(akbytes)
 	if err != nil {
@@ -247,6 +353,20 @@ func (s *server) Quote(ctx context.Context, in *verifier.QuoteRequest) (*verifie
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	glog.V(2).Infof("======= Quote ========")
+
+	evt := ctx.Value(contextKey("event")).(event)
+	glog.V(60).Infof("     Inbound gRPC request from: %s", evt.PeerIP)
+	glog.V(60).Infof("     Inbound EKM: %s", evt.EKM)
+
+	if _, ok := attestationKeys[evt.EKM]; ok {
+		if akbytes == nil {
+			glog.Errorf("Error Quote requires HealthCheck and GetEK GetAK Attest was called first [%s]", evt.EKM)
+			return &verifier.QuoteResponse{}, status.Errorf(codes.Internal, "Error Quote requires GetEK GetAK  Attest called first")
+		}
+	} else {
+		glog.Errorf("Error Attest requires GetEK GetAK  Attest called first  [%s]", evt.EKM)
+		return &verifier.QuoteResponse{}, status.Errorf(codes.Internal, "Error Quote requires GetEK GetAK  Attest called first")
+	}
 
 	ak, err := tpm.LoadAK(akbytes)
 	if err != nil {
@@ -285,6 +405,20 @@ func (s *server) GetTLSKey(ctx context.Context, in *verifier.GetAttestedKeyReque
 	defer s.mu.Unlock()
 	glog.V(2).Infof("======= GetTLSKey ========")
 
+	evt := ctx.Value(contextKey("event")).(event)
+	glog.V(60).Infof("     Inbound gRPC request from: %s", evt.PeerIP)
+	glog.V(60).Infof("     Inbound EKM: %s", evt.EKM)
+
+	if _, ok := attestationKeys[evt.EKM]; ok {
+		if nkBytes == nil {
+			glog.Errorf("Error GetTLSKey requires HealthCheck and GetEK GetAK Attest was called first [%s]", evt.EKM)
+			return &verifier.GetAttestedKeyResponse{}, status.Errorf(codes.Internal, "Error GetTLSKey requires GetEK GetAK  Attest called first")
+		}
+	} else {
+		glog.Errorf("Error GetTLSKey requires GetEK GetAK  Attest called first  [%s]", evt.EKM)
+		return &verifier.GetAttestedKeyResponse{}, status.Errorf(codes.Internal, "Error GetTLSKey requires GetEK GetAK  Attest called first")
+	}
+
 	nk, err := tpm.LoadKey(nkBytes)
 	if err != nil {
 		glog.Errorf("ERROR:  could not load tls key%v", err)
@@ -312,6 +446,10 @@ func gethandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	os.Exit(run()) // since defer func() needs to get called first
+}
+
+func run() int {
 	flag.Set("logtostderr", "true")
 	flag.Set("stderrthreshold", "INFO")
 	flag.Parse()
@@ -319,7 +457,7 @@ func main() {
 	if *grpcport == "" {
 		fmt.Fprintln(os.Stderr, "missing -grpcport flag (:50051)")
 		flag.Usage()
-		os.Exit(2)
+		return 0
 	}
 
 	var err error
@@ -333,7 +471,7 @@ func main() {
 		rwc, err := openTPM(*tpmDevice)
 		if err != nil {
 			glog.Errorf("can't open TPM %q: %v", *tpmDevice, err)
-			os.Exit(1)
+			return 1
 		}
 		defer func() {
 			rwc.Close()
@@ -348,14 +486,14 @@ func main() {
 	tpm, err = attest.OpenTPM(config)
 	if err != nil {
 		glog.Errorf("error opening TPM %v", err)
-		os.Exit(1)
+		return 1
 	}
 	defer tpm.Close()
 
 	eks, err := tpm.EKs()
 	if err != nil {
 		glog.Errorf("error getting EK %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	for _, e := range eks {
@@ -366,7 +504,7 @@ func main() {
 
 	if len(eks) == 0 {
 		glog.Error("error no EK found")
-		os.Exit(1)
+		return 1
 	}
 
 	// use the  ek at 0 for now...
@@ -374,13 +512,13 @@ func main() {
 
 	if ek.Public == nil {
 		glog.Error("error no Public not found")
-		os.Exit(1)
+		return 1
 	}
 
 	ekpubBytes, err = x509.MarshalPKIXPublicKey(ek.Public)
 	if err != nil {
 		glog.Errorf("ERROR:  could  marshall public key %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	if ek.Certificate != nil {
@@ -399,13 +537,13 @@ func main() {
 	ak, err := tpm.NewAK(akConfig)
 	if err != nil {
 		glog.Errorf("ERROR:  could not get AK %v", err)
-		os.Exit(1)
+		return 1
 	}
-
+	defer ak.Close(tpm)
 	akbytes, err = ak.Marshal()
 	if err != nil {
 		glog.Errorf("ERROR:  could marshall AK %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// now crate the TLS EC key on the TPM
@@ -424,30 +562,31 @@ func main() {
 	nk, err := tpm.NewKey(ak, kConfig)
 	if err != nil {
 		glog.Errorf("ERROR:  error creating key  %v", err)
-		os.Exit(1)
+		return 1
 	}
 	err = ak.Close(tpm)
 	if err != nil {
 		glog.Errorf("ERROR:  error closing ak  %v", err)
-		os.Exit(1)
+		return 1
 	}
+	defer nk.Close()
 
 	nkBytes, err = nk.Marshal()
 	if err != nil {
 		glog.Errorf("ERROR:  could not marshall newkey %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	pubKey, ok := nk.Public().(*ecdsa.PublicKey)
 	if !ok {
 		glog.Errorf("Could not assert the public key to ec public key")
-		os.Exit(1)
+		return 1
 	}
 
 	pubkeybytes, err := x509.MarshalPKIXPublicKey(pubKey)
 	if err != nil {
 		glog.Errorf("Could not MarshalPKIXPublicKey ec public key")
-		os.Exit(1)
+		return 1
 	}
 	pubkeyPem := pem.EncodeToMemory(
 		&pem.Block{
@@ -465,7 +604,7 @@ func main() {
 	signer, err := nk.Private(nk.Public())
 	if err != nil {
 		glog.Errorf("ERROR: getting crypto.Signer from generated key %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// generate a CSR
@@ -478,13 +617,13 @@ func main() {
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
 	if err != nil {
 		glog.Errorf("ERROR: Failed to generate serial number: %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	issuerCertBytes, err := os.ReadFile(*issuerCert)
 	if err != nil {
 		glog.Errorf("Error Reading root ca %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	rcblock, _ := pem.Decode(issuerCertBytes)
@@ -492,24 +631,24 @@ func main() {
 	rcert, err := x509.ParseCertificate(rcblock.Bytes)
 	if err != nil {
 		glog.Errorf("ERROR:  error loading issuercertificate %v", err)
-		os.Exit(1)
+		return 1
 	}
 	issuerKeyBytes, err := os.ReadFile(*issuerKey)
 	if err != nil {
 		glog.Errorf("ERROR:  error loading issuerkey %v", err)
-		os.Exit(1)
+		return 1
 	}
 	rblock, _ := pem.Decode(issuerKeyBytes)
 	issuerPrivateKey, err := x509.ParsePKCS8PrivateKey(rblock.Bytes)
 	if err != nil {
 		glog.Errorf("ERROR:  error loading privatekey %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	issuerRootCAs := x509.NewCertPool()
 	if !issuerRootCAs.AppendCertsFromPEM(issuerCertBytes) {
 		glog.Errorf("no root Issuer certs parsed from file ")
-		os.Exit(1)
+		return 1
 	}
 
 	// simulate creating a CSR to send to some CA
@@ -538,7 +677,7 @@ func main() {
 	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &csrtemplate, signer)
 	if err != nil {
 		glog.Errorf("ERROR:  error creating csr %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	csrpemdata := pem.EncodeToMemory(
@@ -558,7 +697,7 @@ func main() {
 	clientCSR, err := x509.ParseCertificateRequest(csrBytes)
 	if err != nil {
 		glog.Errorf("ERROR:  error ParseCertificateRequest %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// now use certain fields within the CSR and the overall template to issue the cert on the CA
@@ -598,13 +737,13 @@ func main() {
 	issuedTLSderBytes, err = x509.CreateCertificate(rand.Reader, &template, rcert, clientCSR.PublicKey, issuerPrivateKey)
 	if err != nil {
 		glog.Errorf("ERROR:  Failed to create certificate: %s\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	p, err := x509.ParseCertificate(issuedTLSderBytes)
 	if err != nil {
 		glog.Errorf("ERROR:  Failed to  parse certificate: %s", err)
-		os.Exit(1)
+		return 1
 	}
 	glog.V(10).Infof("        cert Issuer %s\n", p.Issuer)
 
@@ -614,7 +753,7 @@ func main() {
 	pubkey_bytes, err := x509.MarshalPKIXPublicKey(p.PublicKey)
 	if err != nil {
 		glog.Errorf("ERROR:  Failed to marshall certificate publcikey: %s", err)
-		os.Exit(1)
+		return 1
 	}
 	kpem := pem.EncodeToMemory(
 		&pem.Block{
@@ -667,7 +806,7 @@ func main() {
 	defaultCerts, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 	if err != nil {
 		glog.Errorf("failed to create default certs: %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	tlsConfig := &tls.Config{
@@ -677,16 +816,28 @@ func main() {
 	lis, err := net.Listen("tcp", *grpcport)
 	if err != nil {
 		glog.Errorf("failed to listen: %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	sopts := []grpc.ServerOption{grpc.MaxConcurrentStreams(10)}
 
 	sopts = append(sopts, grpc.Creds(ce), grpc.UnaryInterceptor(authUnaryInterceptor))
 	s := grpc.NewServer(sopts...)
-
-	verifier.RegisterVerifierServer(s, &server{})
+	srv := NewServer()
+	verifier.RegisterVerifierServer(s, srv)
+	healthpb.RegisterHealthServer(s, srv)
 
 	glog.V(2).Infof("Starting gRPC server on port %v", *grpcport)
-	s.Serve(lis)
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		if err := s.Serve(lis); err != nil {
+			glog.Errorf("Error in listenlisten: %s\n", err)
+			return
+		}
+	}()
+	<-done
+
+	return 0
 }
