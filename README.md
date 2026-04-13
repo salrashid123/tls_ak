@@ -215,6 +215,8 @@ I0331 23:26:17.542684   49799 grpc_attestor.go:310] Inbound HTTP request from: 1
 Run the client
 
 ```bash
+export ATTESTOR_ADDRESS=127.0.0.1
+
 go run client/grpc_verifier.go --host=127.0.0.1:50051  \
   --appaddress=$ATTESTOR_ADDRESS:8081  \
      --ekrootCA swtpm/config/var/lib/swtpm-localca/issuercert.pem  --expectedPCRMapSHA256=0:a0b5ff3383a1116bd7dc6df177c0c2d433b9ee1813ea958fa5d166a202cb2a85  \

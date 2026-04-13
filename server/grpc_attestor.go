@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -76,6 +77,8 @@ type db struct {
 	EKCert                *x509.Certificate
 	AKPub                 crypto.PublicKey
 	AttestationParameters *attest.AttestationParameters
+	AKCSR                 *x509.CertificateRequest
+	AKCert                *x509.Certificate
 	Attested              bool
 	Secret                []byte
 	IssuedKey             *ecdsa.PublicKey
@@ -123,6 +126,49 @@ type event struct {
 	PeerCertificates []*x509.Certificate
 	EKM              string
 	PeerIP           string
+}
+
+var (
+	oidExtensionSubjectAltName = []int{2, 5, 29, 17}
+	oidPermanentIdentifier     = []int{1, 3, 6, 1, 5, 5, 7, 8, 3}
+	oidHardwareModuleName      = []int{1, 3, 6, 1, 5, 5, 7, 8, 4}
+)
+
+type otherName struct {
+	TypeID asn1.ObjectIdentifier
+	Value  asn1.RawValue
+}
+
+type permanentIdentifier struct {
+	IdentifierValue string                `asn1:"utf8,optional"`
+	Assigner        asn1.ObjectIdentifier `asn1:"optional"`
+}
+
+type hardwareModuleName struct {
+	SerialNumber []byte `asn1:"tag:4"`
+}
+
+func mustMarshal(val any) ([]byte, error) {
+	data, err := asn1.Marshal(val)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func marshalOtherName(oid asn1.ObjectIdentifier, value interface{}) (asn1.RawValue, error) {
+	valueBytes, err := asn1.MarshalWithParams(value, "explicit,tag:0")
+	if err != nil {
+		return asn1.RawValue{}, err
+	}
+	b, err := asn1.MarshalWithParams(otherName{
+		TypeID: oid,
+		Value:  asn1.RawValue{FullBytes: valueBytes},
+	}, "tag:0")
+	if err != nil {
+		return asn1.RawValue{}, err
+	}
+	return asn1.RawValue{FullBytes: b}, nil
 }
 
 func (s *server) Check(ctx context.Context, in *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
@@ -546,6 +592,195 @@ func run() int {
 		return 1
 	}
 
+	// simulate creating a CSR to send to some CA
+	//  the spiffie and CN i'm just making up and is totally optional..its the serial number for the EK
+	issuerCertBytes, err := os.ReadFile(*issuerCert)
+	if err != nil {
+		glog.Errorf("Error Reading root ca %v", err)
+		return 1
+	}
+
+	rcblock, _ := pem.Decode(issuerCertBytes)
+
+	rcert, err := x509.ParseCertificate(rcblock.Bytes)
+	if err != nil {
+		glog.Errorf("ERROR:  error loading issuercertificate %v", err)
+		return 1
+	}
+	issuerKeyBytes, err := os.ReadFile(*issuerKey)
+	if err != nil {
+		glog.Errorf("ERROR:  error loading issuerkey %v", err)
+		return 1
+	}
+	rblock, _ := pem.Decode(issuerKeyBytes)
+	issuerPrivateKey, err := x509.ParsePKCS8PrivateKey(rblock.Bytes)
+	if err != nil {
+		glog.Errorf("ERROR:  error loading privatekey %v", err)
+		return 1
+	}
+
+	issuerRootCAs := x509.NewCertPool()
+	if !issuerRootCAs.AppendCertsFromPEM(issuerCertBytes) {
+		glog.Errorf("no root Issuer certs parsed from file ")
+		return 1
+	}
+
+	// now issue an AK x509
+
+	var akcsrtemplate = x509.CertificateRequest{
+		Subject: pkix.Name{
+			Organization:       []string{"Acme Co"},
+			OrganizationalUnit: []string{"Enterprise"},
+			Locality:           []string{"Mountain View"},
+			Province:           []string{"California"},
+			Country:            []string{"US"},
+			CommonName:         "attestor.domain.com",
+		},
+		DNSNames:           []string{"attestor.domain.com"},
+		SignatureAlgorithm: x509.SHA256WithRSA,
+	}
+
+	aks, err := NewTPMCrypto(&TPM{
+		TPM: tpm,
+		AK:  ak,
+	})
+	if err != nil {
+		glog.Errorf("Failed to create CSR: %s", err)
+		os.Exit(1)
+	}
+
+	akcsrBytes, err := x509.CreateCertificateRequest(rand.Reader, &akcsrtemplate, aks)
+	if err != nil {
+		glog.Errorf("Failed to create CSR: %s", err)
+		os.Exit(1)
+	}
+	akpemcsr := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "CERTIFICATE REQUEST",
+			Bytes: akcsrBytes,
+		},
+	)
+
+	akcsr, err := x509.ParseCertificateRequest(akcsrBytes)
+	if err != nil {
+		glog.Errorf("Failed to parse CSR: %s", err)
+		os.Exit(1)
+	}
+	// you can send this CSR to a CA
+	glog.V(5).Infof("AK CSR \n%s\n", string(akpemcsr))
+
+	// pretend this is the CA which will sign the AK CSR
+	var aknotBefore time.Time
+	aknotBefore = time.Now()
+
+	aknotAfter := aknotBefore.Add(time.Hour * 24 * 1)
+
+	akserialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	akserialNumber, err := rand.Int(rand.Reader, akserialNumberLimit)
+	if err != nil {
+		glog.Errorf("Failed to generate serial number: %v", err)
+		return 1
+	}
+
+	// add tpm SAN as "OtherName"
+
+	// pg 56:
+	//    https://trustedcomputinggroup.org/wp-content/uploads/TPM-2p0-Keys-for-Device-Identity-and-Attestation_v1_r12_pub10082021.pdf
+
+	// Provider Name is from pg 10 https://trustedcomputinggroup.org/wp-content/uploads/TCG-TPM-Vendor-ID-Registry-Family-1.2-and-2.0-Version-1.07-Revision-0.02_pub.pdf
+	simulatorHW := "SIM0" // we'll assume its a simulator
+	var buf bytes.Buffer
+	buf.WriteString(simulatorHW)
+	buf.WriteString(":")
+	buf.Write(ekCert.AuthorityKeyId)
+	buf.WriteString(":")
+	buf.Write(ekCert.SerialNumber.Bytes())
+
+	pic, err := marshalOtherName(oidHardwareModuleName, hardwareModuleName{
+		SerialNumber: buf.Bytes(),
+	})
+	if err != nil {
+		glog.Errorf("Failed to create oidHardwareModuleName:  %v", err)
+		return 1
+	}
+
+	h := sha256.New()
+	h.Write([]byte(ekCert.Raw))
+	ekHash := h.Sum(nil)
+
+	pi, err := marshalOtherName(oidPermanentIdentifier, permanentIdentifier{
+		IdentifierValue: hex.EncodeToString(ekHash),
+	})
+	if err != nil {
+		glog.Errorf("Failed to create permanentIdentifier %v", err)
+		return 1
+	}
+
+	cc, err := mustMarshal([]asn1.RawValue{pic, pi})
+	if err != nil {
+		glog.Errorf("Failed to generate serial number:  %v", err)
+		return 1
+	}
+
+	extSubjectAltName := pkix.Extension{
+		Id:       oidExtensionSubjectAltName,
+		Critical: false,
+		Value:    cc,
+	}
+
+	// TODO: set the correct extensions
+	// I'm injecting the policy here...this too is just optional and while its not even used, i don't know if this is entirely applicable/correct
+	// pg4  https://trustedcomputinggroup.org/wp-content/uploads/TCG-OID-Registry-Version-1.00-Revision-0.74_10July24.pdf
+	// 2.23.133.11.1.1 tcg-cap-verifiedTPMResidency
+	// 2.23.133.11.1.2 tcg-cap-verifiedTPMFixed
+	verifiedTPMResidency := asn1.ObjectIdentifier{2, 23, 133, 11, 1, 1}
+	verifiedTPMFixed := asn1.ObjectIdentifier{2, 23, 133, 11, 1, 2}
+	verifiedTPMRestricted := asn1.ObjectIdentifier{2, 23, 133, 11, 1, 3}
+	aktemplate := x509.Certificate{
+		SerialNumber: akserialNumber,
+		Subject: pkix.Name{
+			Organization:       []string{"Acme Co"},
+			OrganizationalUnit: []string{"Enterprise"},
+			Locality:           []string{"Mountain View"},
+			Province:           []string{"California"},
+			Country:            []string{"US"},
+			CommonName:         akcsr.Subject.CommonName,
+		},
+		NotBefore: aknotBefore,
+		NotAfter:  aknotAfter,
+		//DNSNames:              csr.DNSNames,
+		KeyUsage: x509.KeyUsageDigitalSignature,
+		//ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
+		PolicyIdentifiers:     []asn1.ObjectIdentifier{verifiedTPMResidency, verifiedTPMFixed, verifiedTPMRestricted},
+		ExtraExtensions:       []pkix.Extension{extSubjectAltName},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &aktemplate, rcert, ak.Public(), issuerPrivateKey)
+	if err != nil {
+		glog.Errorf("Failed to create certificate: %v", err)
+		return 1
+	}
+	// akcert, err := x509.ParseCertificate(derBytes)
+	// if err != nil {
+	// 	glog.Errorf("Failed to create certificate: %v", err)
+	// 	return 1
+	// }
+
+	akCSRPEM := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: derBytes,
+		},
+	)
+
+	glog.V(2).Infof("Issued AKPublic \n%s", string(akCSRPEM))
+
+	// optionally issue an x509 cert using this AK
+	// THis cert isn't used in this flow but you can use this x509 later on and not having to do remote attestation all over again
+	//  with new clients
+
 	// now crate the TLS EC key on the TPM
 	// https://github.com/google/go-attestation/blob/master/attest/tpm.go#L147
 	//   tpm2.FlagSignerDefault ^ tpm2.FlagRestricted
@@ -620,40 +855,6 @@ func run() int {
 		return 1
 	}
 
-	issuerCertBytes, err := os.ReadFile(*issuerCert)
-	if err != nil {
-		glog.Errorf("Error Reading root ca %v", err)
-		return 1
-	}
-
-	rcblock, _ := pem.Decode(issuerCertBytes)
-
-	rcert, err := x509.ParseCertificate(rcblock.Bytes)
-	if err != nil {
-		glog.Errorf("ERROR:  error loading issuercertificate %v", err)
-		return 1
-	}
-	issuerKeyBytes, err := os.ReadFile(*issuerKey)
-	if err != nil {
-		glog.Errorf("ERROR:  error loading issuerkey %v", err)
-		return 1
-	}
-	rblock, _ := pem.Decode(issuerKeyBytes)
-	issuerPrivateKey, err := x509.ParsePKCS8PrivateKey(rblock.Bytes)
-	if err != nil {
-		glog.Errorf("ERROR:  error loading privatekey %v", err)
-		return 1
-	}
-
-	issuerRootCAs := x509.NewCertPool()
-	if !issuerRootCAs.AppendCertsFromPEM(issuerCertBytes) {
-		glog.Errorf("no root Issuer certs parsed from file ")
-		return 1
-	}
-
-	// simulate creating a CSR to send to some CA
-	//  the spiffie and CN i'm just making up and is totally optional..its the serial number for the EK
-
 	deviceSerialNumber := uuid.New().String()
 	var csrtemplate = x509.CertificateRequest{
 		Subject: pkix.Name{
@@ -670,6 +871,7 @@ func run() int {
 			Id:    asn1.ObjectIdentifier{2, 5, 4, 5}, // id-at-serialNumber X520SerialNumber
 			Value: []byte(deviceSerialNumber),
 		}},
+		//ExtraExtensions:    []pkix.Extension{extSubjectAltName},
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}
 
@@ -707,9 +909,6 @@ func run() int {
 	// 2.23.133.11.1.1 tcg-cap-verifiedTPMResidency
 	// 2.23.133.11.1.2 tcg-cap-verifiedTPMFixed
 
-	verifiedTPMResidency := asn1.ObjectIdentifier{2, 23, 133, 11, 1, 1}
-	verifiedTPMFixed := asn1.ObjectIdentifier{2, 23, 133, 11, 1, 2}
-
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
@@ -721,13 +920,14 @@ func run() int {
 			SerialNumber:       clientCSR.Subject.SerialNumber,
 			CommonName:         clientCSR.Subject.CommonName, // from CSR
 		},
-		DNSNames:              clientCSR.DNSNames, // from CSR
-		URIs:                  clientCSR.URIs,
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		Extensions:            clientCSR.Extensions,
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:    clientCSR.DNSNames, // from CSR
+		URIs:        clientCSR.URIs,
+		NotBefore:   notBefore,
+		NotAfter:    notAfter,
+		Extensions:  clientCSR.Extensions,
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		//ExtraExtensions:       []pkix.Extension{extSubjectAltName},
 		PolicyIdentifiers:     []asn1.ObjectIdentifier{verifiedTPMResidency, verifiedTPMFixed},
 		BasicConstraintsValid: true,
 		IsCA:                  false,
@@ -840,4 +1040,37 @@ func run() int {
 	<-done
 
 	return 0
+}
+
+type TPM struct {
+	_ crypto.Signer
+	//_ crypto.MessageSigner // introduced in https://tip.golang.org/doc/go1.25#cryptopkgcrypto
+	_   crypto.MessageSigner
+	TPM *attest.TPM
+	AK  *attest.AK
+}
+
+func NewTPMCrypto(conf *TPM) (TPM, error) {
+
+	if conf.TPM == nil {
+		return TPM{}, fmt.Errorf("AK TPM cannot be null")
+	}
+
+	if conf.AK == nil {
+		return TPM{}, fmt.Errorf("AK cannot be null")
+	}
+
+	return *conf, nil
+}
+
+func (t TPM) Public() crypto.PublicKey {
+	return t.AK.Public()
+}
+
+func (t TPM) Sign(rr io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	return t.AK.SignMsg(t.TPM, digest, opts)
+}
+
+func (t TPM) SignMessage(rand io.Reader, msg []byte, opts crypto.SignerOpts) (signature []byte, err error) {
+	return t.AK.SignMsg(t.TPM, msg, opts)
 }

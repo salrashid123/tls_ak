@@ -367,7 +367,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	akp, err := attest.ParseAKPublic(attest.TPMVersion20, serverAttestationParameter.Public)
+	akp, err := attest.ParseAKPublic(serverAttestationParameter.Public)
 	if err != nil {
 		glog.Errorf("Error Parsing AK %v", err)
 		os.Exit(1)
@@ -392,9 +392,8 @@ func main() {
 	glog.V(5).Infof("=============== start Attest ===============")
 
 	params := attest.ActivationParameters{
-		TPMVersion: attest.TPMVersion20,
-		EK:         ekPubKey,
-		AK:         *serverAttestationParameter,
+		EK: ekPubKey,
+		AK: *serverAttestationParameter,
 	}
 
 	secret, encryptedCredentials, err := params.Generate()
@@ -455,7 +454,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	pub, err := attest.ParseAKPublic(attest.TPMVersion20, serverAttestationParameter.Public)
+	pub, err := attest.ParseAKPublic(serverAttestationParameter.Public)
 	if err != nil {
 		glog.Errorf("Quote Failed ParseAKPublic: %v", err)
 		os.Exit(1)
